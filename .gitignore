@@ -1,0 +1,19 @@
+# ORDER Plugin .gitignore
+
+# OS files
+.DS_Store
+Thumbs.db
+*~
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Backups
+*.backup
+*.bak
+
+# Test artifacts
+*.log

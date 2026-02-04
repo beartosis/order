@@ -1,0 +1,29 @@
+# ORDER Skills Registry
+#
+# These skills are installed ON TOP of CHAOS skills.
+# They enable autonomous operation without human intervention.
+#
+# Usage:
+#   cat .claude/skills/index.yml         # Quick discovery
+#   cat .claude/skills/loop/SKILL.md     # Full skill definition
+
+# ORDER Skills (autonomous operation)
+order:
+  loop:
+    description: Run specs autonomously without human intervention
+    argument: "[spec-name] | --queue | --auto [--dry-run]"
+    modes:
+      single: "Process one spec autonomously"
+      queue: "Process all specs in queue.txt"
+      auto: "Generate and execute specs from codebase analysis"
+    agents_used: [order-sentinel, order-oracle, order-arbiter]
+
+  order-status:
+    description: Check status of an ORDER run
+    argument: ""
+    outputs: "progress, metrics, recent decisions, health status"
+
+# Skill Categories
+#
+# loop          - Main entry point for autonomous execution
+# order-status  - Monitoring and status checking

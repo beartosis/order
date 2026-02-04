@@ -1,0 +1,126 @@
+---
+name: order-status
+description: Check the status of an ORDER run - iterations, time, cost, and recent decisions.
+argument-hint: ""
+---
+
+# Order Status: Monitor Autonomous Execution
+
+Check the current state of an ORDER run.
+
+## Workflow
+
+### Step 1: Read State
+
+```bash
+cat .CHAOS/order/state.json
+```
+
+### Step 2: Read Configuration
+
+```bash
+cat .CHAOS/order/config.yml
+```
+
+### Step 3: Calculate Metrics
+
+- **Elapsed time**: Now - started_at
+- **Progress**: iteration / max_iterations
+- **Cost progress**: estimated_cost / max_cost
+- **Queue remaining**: total - completed - failed - skipped
+
+### Step 4: Get Recent Decisions
+
+Query Beads for recent ORDER decisions:
+
+```bash
+bd list --status=done | head -5
+```
+
+Look for ORDER-ARBITER and ORDER-ORACLE notes in recent issues.
+
+### Step 5: Display Status
+
+---
+
+## Output Format
+
+```markdown
+## ORDER Status
+
+**State**: [RUNNING | PAUSED | COMPLETED | STOPPED]
+**Current Spec**: [spec-name or N/A]
+
+### Progress
+| Metric | Current | Limit | Status |
+|--------|---------|-------|--------|
+| Iterations | 7 | 100 | ✓ |
+| Elapsed | 2h 14m | 24h | ✓ |
+| Est. Cost | $12.40 | $50.00 | ✓ |
+| Consecutive Failures | 0 | 10 | ✓ |
+
+### Specs
+| Status | Count |
+|--------|-------|
+| Completed | 5 |
+| Failed | 1 |
+| Skipped | 1 |
+| Remaining | 3 |
+
+### Recent Decisions
+
+**order-arbiter**:
+- `2025-02-03-api-refactor`: SKIP (external dependency unavailable)
+- `2025-02-03-legacy-fix`: RETRY (trying alternative approach)
+
+**order-oracle**:
+- `2025-02-03-auth`: "Use JWT" (based on existing AuthService pattern)
+- `2025-02-03-cache`: "In-memory" (no Redis dependency exists)
+
+### Health
+- Kill file: [Not present | PRESENT - will stop]
+- Last checkpoint: [timestamp]
+- Beads sync: [OK | Pending]
+```
+
+---
+
+## Quick Commands
+
+Show in terminal without full report:
+
+```bash
+# Quick status
+cat .CHAOS/order/state.json | jq '{status, iteration, current_spec}'
+
+# Check if running
+cat .CHAOS/order/state.json | jq -r '.status'
+
+# List completed
+cat .CHAOS/order/state.json | jq -r '.completed[]'
+
+# Check for kill file
+test -f .CHAOS/order/STOP && echo "KILL FILE PRESENT"
+```
+
+---
+
+## Emergency Actions
+
+### Pause Execution
+```bash
+touch .CHAOS/order/STOP
+```
+Sentinel will detect this and halt the loop.
+
+### Resume Execution
+```bash
+rm .CHAOS/order/STOP
+/loop --queue  # Continue from where it stopped
+```
+
+### View Full Audit Trail
+```bash
+bd list --status=done
+bd show [issue-id]  # For detailed decision history
+```

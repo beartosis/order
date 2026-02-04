@@ -1,0 +1,36 @@
+# ORDER Agent Registry
+#
+# These agents are installed ON TOP of CHAOS agents.
+# They intercept human escalation points for autonomous operation.
+#
+# Usage:
+#   cat .claude/agents/index.yml           # Quick discovery
+#   cat .claude/agents/order-arbiter.md    # Full agent definition
+
+# ORDER Agents (autonomous operation)
+order:
+  order-arbiter:
+    description: Autonomous dispute resolver - never escalates to humans
+    model: sonnet
+    replaces: dispute-resolver
+    tools: [Read, Grep, Glob, Bash]
+    returns: "decision (RETRY/REDUCE_SCOPE/SKIP/HALT), rationale, action"
+
+  order-oracle:
+    description: Autonomous decision maker - answers clarifying questions
+    model: sonnet
+    intercepts: AskUserQuestion
+    tools: [Read, Grep, Glob, Bash]
+    returns: "decision, evidence, confidence level"
+
+  order-sentinel:
+    description: Loop controller - enforces safety limits
+    model: haiku
+    runs: before_each_spec
+    tools: [Read, Bash]
+    returns: "safety status, decision (CONTINUE/STOP)"
+
+# Model Selection
+#
+# sonnet - Used for decision-making (arbiter, oracle)
+# haiku  - Used for quick checks (sentinel)

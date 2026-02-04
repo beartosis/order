@@ -1,0 +1,247 @@
+---
+name: loop
+description: Run specs autonomously without human intervention. Main entry point for ORDER.
+argument-hint: "[spec-name] | --queue | --auto [--dry-run]"
+disable-model-invocation: true
+allowed-tools: Read, Grep, Glob, Bash, Task, Write, TodoWrite
+---
+
+# Loop: Autonomous Spec Execution
+
+Execute specs without human intervention using ORDER agents.
+
+## Modes
+
+### Single Spec Mode
+```
+/loop 2025-02-03-my-feature
+```
+Process a single spec autonomously.
+
+### Queue Mode
+```
+/loop --queue
+```
+Process all specs listed in `.CHAOS/order/queue.txt`.
+
+### Autonomous Mode
+```
+/loop --auto
+```
+Generate specs from codebase analysis and execute them.
+
+### Dry Run
+```
+/loop --dry-run [spec-name]
+/loop --queue --dry-run
+```
+Simulate execution without making changes.
+
+---
+
+## Workflow
+
+### Step 1: Initialize State
+
+```bash
+# Create/update state file
+cat > .CHAOS/order/state.json << 'EOF'
+{
+  "status": "running",
+  "started_at": "$(date -Iseconds)",
+  "current_spec": null,
+  "iteration": 0,
+  "completed": [],
+  "failed": [],
+  "skipped": [],
+  "estimated_cost_dollars": 0,
+  "consecutive_failures": 0
+}
+EOF
+```
+
+### Step 2: Load Configuration
+
+```bash
+cat .CHAOS/order/config.yml
+```
+
+Check safety limits:
+- `max_iterations`
+- `max_time_hours`
+- `max_cost_dollars`
+- `max_consecutive_failures`
+
+### Step 3: Build Spec Queue
+
+**Single spec**: Queue contains just the specified spec
+
+**Queue mode**: Read from `.CHAOS/order/queue.txt`
+```bash
+grep -v '^#' .CHAOS/order/queue.txt | grep -v '^$'
+```
+
+**Auto mode**:
+1. Launch `code-explorer` for codebase analysis
+2. Launch `order-oracle` to prioritize and generate specs
+3. Add generated specs to queue
+
+### Step 4: Process Loop
+
+For each spec in queue:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  1. SENTINEL CHECK                                       │
+│     └─► Launch order-sentinel                           │
+│         └─► If STOP: exit loop                          │
+│                                                          │
+│  2. UPDATE STATE                                         │
+│     └─► Set current_spec, increment iteration           │
+│                                                          │
+│  3. ORCHESTRATE (with ORDER agents)                     │
+│     └─► /orchestrate [spec-name]                        │
+│         ├─► order-oracle answers questions              │
+│         └─► order-arbiter handles failures              │
+│                                                          │
+│  4. RECORD RESULT                                        │
+│     ├─► Success: Add to completed[], reset failures     │
+│     ├─► Skip: Add to skipped[], continue                │
+│     └─► Fail: Add to failed[], increment failures       │
+│                                                          │
+│  5. LOG TO BEADS                                         │
+│     └─► bd update with result summary                   │
+│                                                          │
+│  6. CHECK BEHAVIOR                                       │
+│     └─► If failure and on_unresolvable=halt: exit      │
+│                                                          │
+│  7. CONTINUE                                             │
+│     └─► Next spec in queue                              │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Step 5: Completion
+
+```bash
+# Update final state
+state.status = "completed"
+
+# Sync beads
+bd sync --flush-only
+
+# Report summary
+```
+
+---
+
+## Agent Integration
+
+### order-sentinel (before each spec)
+```
+Task(order-sentinel, run_in_background: true):
+  Check all safety limits
+  Return: CONTINUE or STOP with reason
+```
+
+### order-oracle (during orchestration)
+Automatically intercepts `AskUserQuestion` calls from other agents.
+Makes decisions based on codebase analysis.
+
+### order-arbiter (on 3rd failure)
+Replaces `dispute-resolver` behavior.
+Never escalates - decides RETRY, REDUCE_SCOPE, SKIP, or HALT.
+
+---
+
+## Dry Run Mode
+
+When `--dry-run` is specified:
+- Read specs and validate them
+- Run sentinel checks
+- Simulate orchestration decisions
+- Log what WOULD happen
+- Make NO code changes
+- Make NO git commits
+
+---
+
+## Output Format
+
+### During Execution
+```
+ORDER Loop: Processing 2025-02-03-feature (3 of 10)
+├─ Sentinel: OK (iter 3/100, 1h 23m/24h, $4.20/$50)
+├─ Orchestrate: Running...
+│  ├─ oracle: Decided "use Redis" (HIGH confidence)
+│  └─ arbiter: N/A (no failures)
+└─ Result: COMPLETED
+
+ORDER Loop: Processing 2025-02-03-api-refactor (4 of 10)
+├─ Sentinel: OK
+├─ Orchestrate: FAILED (attempt 3)
+│  └─ arbiter: SKIP - external dependency unavailable
+└─ Result: SKIPPED
+```
+
+### Final Summary
+```markdown
+## ORDER Loop Complete
+
+**Duration**: 2h 34m
+**Specs Processed**: 10
+**Estimated Cost**: $12.40
+
+| Status | Count | Specs |
+|--------|-------|-------|
+| Completed | 7 | feature, auth, ui, ... |
+| Skipped | 2 | api-refactor, legacy-fix |
+| Failed | 1 | complex-migration |
+
+**Arbiter Decisions**:
+- api-refactor: SKIP (external dependency)
+- legacy-fix: SKIP (ambiguous requirements)
+- complex-migration: HALT (data corruption risk)
+
+**Review Required**:
+- Check skipped specs in Beads audit trail
+- complex-migration needs human intervention
+```
+
+---
+
+## Configuration Reference
+
+```yaml
+# .CHAOS/order/config.yml
+
+safety:
+  max_iterations: 100
+  max_time_hours: 24
+  max_cost_dollars: 50.00
+  max_consecutive_failures: 10
+
+behavior:
+  on_unresolvable: skip    # skip | halt
+  auto_commit: true
+  branch_prefix: order/
+  dry_run: false
+
+autonomous:
+  enabled: true
+  health_gates:
+    min_test_coverage: 70
+    max_critical_issues: 0
+    max_high_issues: 5
+  allow_feature_specs: false
+```
+
+---
+
+## CRITICAL Rules
+
+1. **Always run sentinel first** - Safety checks are mandatory
+2. **Respect kill file** - Check `.CHAOS/order/STOP` exists
+3. **Log everything to Beads** - Audit trail required
+4. **Never skip sentinel** - Even in dry-run mode
+5. **Update state atomically** - Keep state.json consistent
+6. **Branch per spec** - Use `order/[spec-name]` branches
