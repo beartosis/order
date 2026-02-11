@@ -1,0 +1,160 @@
+---
+name: work-wrapper
+description: |
+  Wrapper for spawned CHAOS /work instances. Manages status tracking
+  and PR extraction for ORDER coordination.
+  INTERNAL USE ONLY - called by /parallel to spawn parallel workers.
+  For interactive use, use /work directly.
+argument-hint: "<task-id>"
+disable-model-invocation: true
+allowed-tools: Read, Grep, Glob, Bash, Task, Write, TodoWrite
+---
+
+# Work Wrapper: Spawned Instance Manager
+
+Thin wrapper around CHAOS `/work` that adds status tracking for ORDER coordination. Used by `/parallel` to manage spawned instances.
+
+**This skill is designed for spawned CLI instances, not interactive use.**
+
+## Entry Point
+
+This skill is invoked by ORDER like:
+```bash
+claude -p "/work-wrapper my-task" \
+  --dangerously-skip-permissions \
+  --model sonnet \
+  > .chaos/framework/runs/my-task/output.log 2>&1 &
+```
+
+---
+
+## Phase 0: Initialize
+
+Write initial status to signal we've started:
+
+```bash
+TASK_ID="$ARGUMENTS"
+RUN_DIR=".chaos/framework/runs/$TASK_ID"
+mkdir -p "$RUN_DIR"
+
+# Write initial status
+cat > "$RUN_DIR/status.json" << EOF
+{
+  "status": "running",
+  "task": "$TASK_ID",
+  "started_at": "$(date -Iseconds)",
+  "ended_at": null,
+  "pr_number": null,
+  "beads_issue": null,
+  "files_changed": [],
+  "tests_passed": null,
+  "error": null
+}
+EOF
+```
+
+---
+
+## Phase 1: Invoke /work
+
+Run the CHAOS `/work` skill which handles the full development cycle:
+1. Read task from Beads + learnings + standards
+2. Explore codebase
+3. Plan with TodoWrite
+4. Implement changes
+5. Run /self-check
+6. Create branch + push draft PR
+7. Update Beads
+
+```
+/work $TASK_ID
+```
+
+---
+
+## Phase 2: Extract Results
+
+After `/work` completes, extract the PR number and update status:
+
+```bash
+# Find the PR created by /work
+PR_NUM=$(gh pr list --head "task/$TASK_ID" --json number -q '.[0].number')
+
+# Get Beads issue ID
+BEADS_ID=$(bd list --status=active | grep "$TASK_ID" | head -1 | awk '{print $1}')
+
+# Get list of changed files
+FILES_JSON=$(gh pr view "$PR_NUM" --json files -q '.files[].path' | jq -R . | jq -s .)
+```
+
+---
+
+## Phase 3: Write Final Status
+
+```bash
+started_at=$(jq -r '.started_at' "$RUN_DIR/status.json")
+ended_at=$(date -Iseconds)
+
+if [ -n "$PR_NUM" ]; then
+  # Success
+  cat > "$RUN_DIR/status.json" << EOF
+{
+  "status": "success",
+  "task": "$TASK_ID",
+  "started_at": "$started_at",
+  "ended_at": "$ended_at",
+  "pr_number": $PR_NUM,
+  "beads_issue": "$BEADS_ID",
+  "files_changed": $FILES_JSON,
+  "tests_passed": true,
+  "error": null
+}
+EOF
+else
+  # Failed - no PR created
+  cat > "$RUN_DIR/status.json" << EOF
+{
+  "status": "failed",
+  "task": "$TASK_ID",
+  "started_at": "$started_at",
+  "ended_at": "$ended_at",
+  "pr_number": null,
+  "beads_issue": "$BEADS_ID",
+  "files_changed": [],
+  "tests_passed": false,
+  "error": "No PR created"
+}
+EOF
+fi
+```
+
+---
+
+## Phase 4: Exit
+
+After writing status, exit cleanly:
+- Exit code 0 for success (PR created)
+- Exit code 1 for failure (no PR)
+
+---
+
+## Key Differences from /work
+
+| Aspect | /work | /work-wrapper |
+|--------|-------|---------------|
+| Entry | Interactive or spawned | Spawned CLI process only |
+| Status tracking | Via Beads | status.json + Beads |
+| PR extraction | Part of workflow | Explicit post-step |
+| Exit | Continues conversation | Process terminates |
+| Used by | Human or /loop | /parallel |
+
+---
+
+## CRITICAL Rules
+
+1. **Write status.json immediately** - Signal to ORDER we've started
+2. **Invoke /work for all real work** - This is just a wrapper
+3. **Extract PR number** - ORDER needs it for review pipeline
+4. **Write final status.json** - ORDER reads this after `wait`
+5. **Exit cleanly** - Don't hang, terminate when done
+6. **Update Beads** - Record work in issue tracker

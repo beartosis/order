@@ -1,0 +1,15 @@
+# ORDER Task Queue v2.0
+#
+# List tasks to process (one per line).
+# Lines starting with # are comments.
+# Processed tasks are removed from this file.
+#
+# Format: <task-id>|wave:<N>|deps:[<id>,...]|gh:<issue#>|bd:<beads-id>
+#
+# Example:
+# setup-models|wave:1|deps:[]|gh:42|bd:ABC123
+# setup-config|wave:1|deps:[]|gh:43|bd:DEF456
+# api-endpoints|wave:2|deps:[setup-models,setup-config]|gh:44|bd:GHI789
+#
+# Simple format (when not using /plan-work):
+# my-task-name

@@ -1,0 +1,520 @@
+---
+name: parallel
+description: |
+  Wave-based parallel task execution. Spawns parallel CHAOS /work instances
+  grouped by dependency waves. Reviews and merges PRs in batches.
+  USE WHEN: You have multiple tasks and want parallelism within waves.
+  ALTERNATIVE: Use /loop for sequential processing in a single conversation.
+argument-hint: "[--queue | --auto]"
+disable-model-invocation: true
+allowed-tools: Read, Grep, Glob, Bash, Task, Write, TodoWrite
+---
+
+# Parallel: Wave-Based Task Execution
+
+Spawn and coordinate parallel CHAOS `/work` instances grouped by dependency waves. Tasks within a wave run simultaneously; waves run sequentially.
+
+## Modes
+
+### Queue Mode
+```
+/parallel --queue
+```
+Process all tasks in `.chaos/framework/order/queue.txt` using parallel instances per wave.
+
+### Autonomous Mode
+```
+/parallel --auto
+```
+Generate tasks from codebase analysis, then process in parallel waves.
+
+---
+
+## Quick Discovery
+
+```bash
+cat .chaos/framework/order/config.yml    # Configuration including safety limits
+cat .chaos/framework/order/queue.txt     # Task queue with wave metadata
+ls .chaos/framework/runs/                 # Per-task status directories
+```
+
+---
+
+## Phase 0: Initialize
+
+### Create directories
+```bash
+mkdir -p .chaos/framework/runs
+mkdir -p .chaos/framework/order/summaries
+```
+
+### Load configuration
+```bash
+cat .chaos/framework/order/config.yml
+```
+
+Key settings:
+- `safety.max_iterations`: Total tasks to process
+- `safety.max_consecutive_failures`: Failure threshold
+- `pr_workflow.gha_wait_timeout_minutes`: GHA wait limit
+
+### Initialize state
+```bash
+cat > .chaos/framework/order/state.json << 'EOF'
+{
+  "status": "running",
+  "started_at": "$(date -Iseconds)",
+  "mode": "parallel",
+  "wave": 0,
+  "iteration": 0,
+  "active_instances": [],
+  "completed": [],
+  "failed": [],
+  "skipped": [],
+  "consecutive_failures": 0,
+  "prs": {}
+}
+EOF
+```
+
+### Validate Lifecycle State
+
+```bash
+# Verify we're in a valid state for task execution
+CURRENT_STATE=$(cat .chaos/framework/order/state.json | jq -r '.current_state // "INIT"')
+if [[ "$CURRENT_STATE" != "EXECUTE_TASKS" && "$CURRENT_STATE" != "INIT" ]]; then
+  echo "ERROR: Cannot execute tasks in state $CURRENT_STATE"
+  echo "Expected: EXECUTE_TASKS or INIT"
+  exit 1
+fi
+```
+
+---
+
+## Phase 1: Build Queue & Dependency Waves
+
+### Queue Mode
+```bash
+# Read queue file (v2 format with wave metadata)
+grep -v '^#' .chaos/framework/order/queue.txt | grep -v '^$'
+```
+
+Parse each line:
+```
+task-name|wave:1|deps:[]|bd:ABC123
+```
+
+### Auto Mode
+1. Explore codebase for improvement opportunities
+2. Use `/plan-work` to decompose into tasks with waves
+3. Load resulting queue
+
+### Group by Waves
+
+Tasks are pre-grouped by `/plan-work`. Parse wave numbers:
+- **Wave 1**: Tasks with `wave:1` (no dependencies)
+- **Wave 2**: Tasks with `wave:2` (depend on Wave 1)
+- etc.
+
+---
+
+## Phase 1.5: File-Conflict Detection
+
+Before spawning a wave, check for file overlaps between tasks within the same wave. Tasks that modify the same files cannot safely run in parallel.
+
+### Detect overlaps
+```bash
+# For each task in the wave, extract expected file list from Beads issue
+for TASK_ID in "${WAVE_TASKS[@]}"; do
+  BD_ID=$(echo "$TASK_LINE" | grep -oP 'bd:\K[^ |]+')
+  # Extract file list from Beads issue (files_likely field)
+  bd show "$BD_ID" 2>/dev/null \
+    | sed -n '/^files_likely:/,/^[^ ]/p' \
+    | grep '^\s*-' \
+    | sed 's/.*- *//' \
+    > ".chaos/framework/runs/$TASK_ID/expected_files.txt"
+done
+
+# Find overlapping files between tasks in this wave
+CONFLICTS=()
+for i in "${!WAVE_TASKS[@]}"; do
+  for j in $(seq $((i+1)) $((${#WAVE_TASKS[@]}-1))); do
+    OVERLAP=$(comm -12 \
+      <(sort ".chaos/framework/runs/${WAVE_TASKS[$i]}/expected_files.txt") \
+      <(sort ".chaos/framework/runs/${WAVE_TASKS[$j]}/expected_files.txt"))
+    if [[ -n "$OVERLAP" ]]; then
+      echo "CONFLICT: ${WAVE_TASKS[$i]} and ${WAVE_TASKS[$j]} both modify:"
+      echo "$OVERLAP"
+      CONFLICTS+=("${WAVE_TASKS[$j]}")
+    fi
+  done
+done
+```
+
+### Resolve conflicts
+- Move conflicting tasks to the next wave
+- Keep the first task (lower index) in the current wave
+- Log the deferral to state.json
+
+---
+
+## Phase 2: Main Loop (Wave-Based)
+
+```
+FOR each wave in dependency_waves:
+
+  1. SENTINEL CHECK
+     > bash .claude/scripts/sentinel-check.sh
+       > If exit 1 (STOP): exit loop
+
+  2. SPAWN ALL TASKS IN WAVE
+     > For each task in wave:
+       > Spawn: claude -p "/work task-id" ...
+       > Record PID
+     > All tasks in wave spawn immediately
+
+  3. WAIT FOR WAVE COMPLETION
+     > Use `wait` to block until ALL processes exit
+
+  4. COLLECT RESULTS & FIND PRs
+     > For each task in wave:
+       > Read output log / Beads for PR number
+       > Record in state
+
+  5. PR LIFECYCLE (CHAOS autonomous)
+     > CHAOS /pr-monitor handles each PR's feedback loop
+     > Polls GHA every 2 min, addresses feedback, merges when gates pass
+     > ORDER waits for all PRs in wave to reach terminal state
+
+  8.5 REBASE REMAINING BRANCHES
+     > After merging, rebase remaining wave branches onto main
+     > If conflicts: attempt auto-resolve, invoke /order-arbiter if severe
+
+  9. BATCH LEARN
+     > Spawn /learn instances for merged PRs
+     > Wait for completion
+
+ 10. PULL MAIN
+     > git pull origin main (keep local up to date for next wave)
+
+ 11. CONTINUE TO NEXT WAVE
+```
+
+---
+
+## Spawning a Wave
+
+### Spawn all tasks in wave
+```bash
+# Array to track PIDs
+PIDS=()
+
+# Spawn each task in the wave
+for TASK_ID in "${WAVE_TASKS[@]}"; do
+  RUN_DIR=".chaos/framework/runs/$TASK_ID"
+  mkdir -p "$RUN_DIR"
+
+  # Spawn CHAOS /work instance
+  claude -p "/work $TASK_ID" \
+    --dangerously-skip-permissions \
+    --model sonnet \
+    > "$RUN_DIR/output.log" 2>&1 &
+
+  # Track PID
+  PID=$!
+  PIDS+=($PID)
+  echo $PID > "$RUN_DIR/pid"
+
+  echo "Spawned: $TASK_ID (pid $PID)"
+done
+
+echo "Wave spawned: ${#PIDS[@]} instances"
+```
+
+### Wait for wave completion
+```bash
+# Block until ALL processes in wave complete
+wait "${PIDS[@]}"
+
+echo "Wave complete - all instances finished"
+```
+
+---
+
+## Collecting Results
+
+### After wave completes
+```bash
+for TASK_ID in "${WAVE_TASKS[@]}"; do
+  RUN_DIR=".chaos/framework/runs/$TASK_ID"
+
+  # Run post-task hook to capture results and update state
+  EXIT_CODE=$(wait $(<"$RUN_DIR/pid") 2>/dev/null; echo $?)
+  bash .claude/scripts/post-task-hook.sh "$TASK_ID" "$EXIT_CODE"
+
+  # Find the PR created by /work
+  PR_NUM=$(gh pr list --head "task/$TASK_ID" --json number -q '.[0].number')
+
+  if [ -n "$PR_NUM" ]; then
+    echo "SUCCESS: $TASK_ID -> PR #$PR_NUM"
+    echo "$PR_NUM" > "$RUN_DIR/pr_number"
+  else
+    echo "FAILED: $TASK_ID (no PR created)"
+  fi
+
+  # Clean up pid file
+  rm -f "$RUN_DIR/pid"
+done
+```
+
+---
+
+## Batch PR Operations
+
+### PR Monitoring (CHAOS autonomous)
+
+CHAOS `/pr-monitor` handles the full PR lifecycle for each task. ORDER monitors completion:
+
+```bash
+for TASK_ID in "${WAVE_TASKS[@]}"; do
+  PR_NUM=$(cat ".chaos/framework/runs/$TASK_ID/pr_number" 2>/dev/null)
+  [ -z "$PR_NUM" ] && continue
+
+  # CHAOS /pr-monitor autonomously handles:
+  # - GHA polling every 2 minutes
+  # - Feedback iteration (up to 10 cycles)
+  # - Merge when all gates pass
+  # ORDER checks terminal state
+  PR_STATE=$(gh pr view "$PR_NUM" --json state -q '.state')
+  echo "$TASK_ID: PR #$PR_NUM -> $PR_STATE"
+done
+```
+
+### Batch merge
+```bash
+for TASK_ID in "${WAVE_TASKS[@]}"; do
+  PR_NUM=$(cat ".chaos/framework/runs/$TASK_ID/pr_number" 2>/dev/null)
+  [ -z "$PR_NUM" ] && continue
+
+  gh pr merge "$PR_NUM" --squash --delete-branch
+  echo "Merged: $TASK_ID -> PR #$PR_NUM"
+done
+```
+
+### Batch learn
+```bash
+LEARN_PIDS=()
+
+for TASK_ID in "${MERGED_TASKS[@]}"; do
+  RUN_DIR=".chaos/framework/runs/$TASK_ID"
+
+  claude -p "/learn" \
+    --dangerously-skip-permissions \
+    --model sonnet \
+    > "$RUN_DIR/learn.log" 2>&1 &
+
+  LEARN_PIDS+=($!)
+done
+
+wait "${LEARN_PIDS[@]}"
+```
+
+---
+
+## Phase 2.5: Merge-Conflict Handling
+
+After each wave's batch merge, remaining branches in later waves may conflict with the newly merged code.
+
+### Rebase remaining branches
+```bash
+# Pull latest main after merges
+git checkout main && git pull origin main
+
+# For each branch in upcoming waves, check for conflicts
+for TASK_ID in "${REMAINING_TASKS[@]}"; do
+  BRANCH="task/$TASK_ID"
+  git checkout "$BRANCH" 2>/dev/null || continue
+
+  if ! git rebase main 2>/dev/null; then
+    # Conflict detected
+    CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+    git rebase --abort
+
+    echo "CONFLICT: $TASK_ID has merge conflicts in: $CONFLICT_FILES"
+
+    # If conflicts are minor (< 3 files), note for the task to resolve
+    CONFLICT_COUNT=$(echo "$CONFLICT_FILES" | wc -l)
+    if [[ "$CONFLICT_COUNT" -lt 3 ]]; then
+      echo "Minor conflict — task will resolve during /work"
+    else
+      echo "Severe conflict — invoking /order-arbiter"
+      # /order-arbiter decides: retry, reduce scope, or skip
+    fi
+  fi
+done
+
+git checkout main
+```
+
+---
+
+## Phase 3: Completion
+
+### Write final state
+```bash
+cat > .chaos/framework/order/state.json << EOF
+{
+  "status": "completed",
+  "started_at": "$started_at",
+  "ended_at": "$(date -Iseconds)",
+  "mode": "parallel",
+  "waves_completed": $total_waves,
+  "iteration": $total_processed,
+  "active_instances": [],
+  "completed": $completed_json,
+  "failed": $failed_json,
+  "skipped": $skipped_json,
+  "consecutive_failures": 0,
+  "prs": $prs_json
+}
+EOF
+```
+
+### Write Structured Result to state.json
+
+```bash
+# Count completed and failed tasks
+COMPLETED=$(cat .chaos/framework/order/state.json | jq '.completed | length')
+FAILED=$(cat .chaos/framework/order/state.json | jq '.failed | length')
+
+if [ "$FAILED" -eq 0 ]; then
+  VERDICT="TASKS_COMPLETE"
+else
+  VERDICT="TASKS_FAILED"
+fi
+
+# Write last_result for orchestrator
+cat .chaos/framework/order/state.json | jq \
+  --arg state "EXECUTE_TASKS" \
+  --arg time "$(date -Iseconds)" \
+  --arg skill "parallel" \
+  --arg verdict "$VERDICT" \
+  --argjson failures "$FAILED" \
+  '.current_state = $state | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}] | .last_result = {skill: $skill, verdict: $verdict, failures: $failures}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+### Verify Completion and Handoff
+
+When all waves complete successfully:
+
+```bash
+# Verify all completion gates pass for the current step
+/verify-completion <step-number>
+
+# If COMPLETE: create handoff for next ORDER instance
+/handoff <step-number>
+```
+
+> Only trigger handoff when `/verify-completion` returns COMPLETE.
+
+### Generate summary report
+```bash
+cat > ".chaos/framework/order/summaries/$(date +%Y-%m-%d).md" << 'EOF'
+# ORDER Summary: $(date +%Y-%m-%d)
+
+## Progress
+- Waves completed: W
+- Tasks completed: X
+- Tasks failed: Y
+- PRs merged: Z
+
+## PR Pipeline
+| PR# | Task | Wave | ORDER Review | GHA | Status |
+|-----|------|------|-------------|-----|--------|
+[list from .chaos/framework/runs/*/pr_number]
+
+## Failed
+| Task | Wave | Error | Retries |
+|------|------|-------|---------|
+[list from failed tasks]
+EOF
+```
+
+---
+
+## Output Format
+
+### During execution
+```
+ORDER: Starting Wave 1 (2 tasks)
++- Spawned: setup-models (pid 1234)
++- Spawned: setup-config (pid 1235)
++- Waiting for wave completion...
++- Wave 1 complete
+|  +- SUCCESS: setup-models -> PR #42
+|  +- SUCCESS: setup-config -> PR #43
++- Reviewing PRs...
+|  +- PR #42: APPROVED
+|  +- PR #43: APPROVED
++- Waiting for GHA...
++- Merging PRs...
+|  +- Merged: PR #42
+|  +- Merged: PR #43
++- Learning from merges...
+
+ORDER: Starting Wave 2 (3 tasks)
++- Spawned: api-endpoints (pid 2345)
++- Spawned: auth-middleware (pid 2346)
++- Spawned: validation-layer (pid 2347)
+...
+```
+
+### Final summary
+```markdown
+## ORDER Complete
+
+**Duration**: 1h 23m
+**Tasks Processed**: 8
+**Mode**: Parallel (wave-based)
+**Waves**: 3
+**PRs Merged**: 7
+
+| Wave | Tasks | PRs | Status |
+|------|-------|-----|--------|
+| 1 | setup-models, setup-config | #42, #43 | All merged |
+| 2 | api-endpoints, auth, validation | #44, #45, #46 | All merged |
+| 3 | integration-tests, docs | #47, #48 | 1 failed |
+```
+
+---
+
+## Why `wait` Instead of Polling
+
+```bash
+# Old approach (polling):
+while [ processes_running ]; do
+  sleep 60  # Wastes time if processes finish early
+done
+
+# New approach (wait):
+wait "${PIDS[@]}"  # Blocks exactly until completion
+```
+
+Benefits:
+- **No wasted time**: Returns immediately when all processes finish
+- **No arbitrary intervals**: No guessing how often to poll
+- **Simpler code**: One line vs. polling loop
+
+---
+
+## CRITICAL Rules
+
+1. **Sentinel before each wave** - Check limits before spawning
+2. **Spawn entire wave at once** - All tasks in wave start together
+3. **Use `wait` not polling** - Block until wave completes
+4. **Batch review after wave** - Review all PRs from wave together
+5. **GHA must approve** - via CHAOS /pr-monitor before merge
+6. **Batch learn after merge** - Capture observations from all merged PRs
+7. **Track PIDs in array** - Pass to `wait` for proper blocking
+8. **Update state after each wave** - Keep state.json consistent

@@ -1,33 +1,33 @@
 ---
 name: order-status
-description: Check the status of an ORDER run - iterations, time, cost, and recent decisions.
+description: Check the status of an ORDER run - tasks, PRs, reviews, and recent decisions.
 argument-hint: ""
 ---
 
-# Order Status: Monitor Autonomous Execution
+# Order Status: Monitor Task Execution
 
-Check the current state of an ORDER run.
+Check the current state of an ORDER run, including task progress, PR pipeline, and oracle/arbiter decisions.
 
 ## Workflow
 
 ### Step 1: Read State
 
 ```bash
-cat .CHAOS/order/state.json
+cat .chaos/framework/order/state.json
 ```
 
 ### Step 2: Read Configuration
 
 ```bash
-cat .CHAOS/order/config.yml
+cat .chaos/framework/order/config.yml
 ```
 
 ### Step 3: Calculate Metrics
 
 - **Elapsed time**: Now - started_at
 - **Progress**: iteration / max_iterations
-- **Cost progress**: estimated_cost / max_cost
 - **Queue remaining**: total - completed - failed - skipped
+- **PR pipeline**: Count PRs by status (draft, in review, merged, failed)
 
 ### Step 4: Get Recent Decisions
 
@@ -37,9 +37,19 @@ Query Beads for recent ORDER decisions:
 bd list --status=done | head -5
 ```
 
-Look for ORDER-ARBITER and ORDER-ORACLE notes in recent issues.
+Look for ORDER-REVIEW, ORDER-ARBITER, and ORDER-ORACLE notes in recent issues.
 
-### Step 5: Display Status
+### Step 5: Check PR Pipeline
+
+```bash
+# List all open PRs from ORDER
+gh pr list --label "order" --json number,title,state,reviewDecision
+
+# Or by branch prefix
+gh pr list --search "head:task/" --json number,title,state,reviewDecision
+```
+
+### Step 6: Display Status
 
 ---
 
@@ -49,17 +59,16 @@ Look for ORDER-ARBITER and ORDER-ORACLE notes in recent issues.
 ## ORDER Status
 
 **State**: [RUNNING | PAUSED | COMPLETED | STOPPED]
-**Current Spec**: [spec-name or N/A]
+**Current Task**: [task-name or N/A]
 
 ### Progress
 | Metric | Current | Limit | Status |
 |--------|---------|-------|--------|
-| Iterations | 7 | 100 | ✓ |
-| Elapsed | 2h 14m | 24h | ✓ |
-| Est. Cost | $12.40 | $50.00 | ✓ |
-| Consecutive Failures | 0 | 10 | ✓ |
+| Iterations | 7 | 100 | OK |
+| Elapsed | 2h 14m | 24h | OK |
+| Consecutive Failures | 0 | 10 | OK |
 
-### Specs
+### Tasks
 | Status | Count |
 |--------|-------|
 | Completed | 5 |
@@ -67,15 +76,43 @@ Look for ORDER-ARBITER and ORDER-ORACLE notes in recent issues.
 | Skipped | 1 |
 | Remaining | 3 |
 
+### PR Pipeline
+| PR# | Task | ORDER Review | GHA | Status |
+|-----|------|-------------|-----|--------|
+| #42 | feature | APPROVED | APPROVED | Merged |
+| #43 | auth | APPROVED | Pending | In Review |
+| #44 | api | CHANGES_REQUESTED | - | Needs Fixes |
+
+### Roadmap Progress
+
+Phase: {M}/{total_phases} ({phase_name})
+Step: {S}/{steps_in_phase} in current phase
+Overall: {total_completed}/{total_steps} steps ({pct}%)
+
+Current Step:
+  {N}. [{status}] {title} — {description} `{complexity}`
+  Status: {lifecycle_state}
+  Tasks: {completed}/{total} complete (Beads Issues)
+  PRs: {pr_list}
+
+### Lifecycle State
+  Current: {current_state}
+  Last Transition: {timestamp}
+
+### Completion Gates
+  Issues Closed: {closed}/{total}
+  PRs Merged: {merged}/{total}
+  Tests: {PASSING | FAILING}
+  GHA Warnings: {count}
+
 ### Recent Decisions
 
-**order-arbiter**:
-- `2025-02-03-api-refactor`: SKIP (external dependency unavailable)
-- `2025-02-03-legacy-fix`: RETRY (trying alternative approach)
+**/order-oracle**:
+- sizing: "Split into 3 tasks" (based on LOC analysis)
 
-**order-oracle**:
-- `2025-02-03-auth`: "Use JWT" (based on existing AuthService pattern)
-- `2025-02-03-cache`: "In-memory" (no Redis dependency exists)
+**/order-arbiter**:
+- api-refactor: SKIP (external dependency unavailable)
+- legacy-fix: RETRY (trying alternative approach)
 
 ### Health
 - Kill file: [Not present | PRESENT - will stop]
@@ -91,16 +128,19 @@ Show in terminal without full report:
 
 ```bash
 # Quick status
-cat .CHAOS/order/state.json | jq '{status, iteration, current_spec}'
+cat .chaos/framework/order/state.json | jq '{status, iteration, current_task}'
 
 # Check if running
-cat .CHAOS/order/state.json | jq -r '.status'
+cat .chaos/framework/order/state.json | jq -r '.status'
 
-# List completed
-cat .CHAOS/order/state.json | jq -r '.completed[]'
+# List completed tasks
+cat .chaos/framework/order/state.json | jq -r '.completed[]'
+
+# List PRs
+cat .chaos/framework/order/state.json | jq '.prs'
 
 # Check for kill file
-test -f .CHAOS/order/STOP && echo "KILL FILE PRESENT"
+test -f .chaos/framework/order/STOP && echo "KILL FILE PRESENT"
 ```
 
 ---
@@ -109,13 +149,13 @@ test -f .CHAOS/order/STOP && echo "KILL FILE PRESENT"
 
 ### Pause Execution
 ```bash
-touch .CHAOS/order/STOP
+touch .chaos/framework/order/STOP
 ```
 Sentinel will detect this and halt the loop.
 
 ### Resume Execution
 ```bash
-rm .CHAOS/order/STOP
+rm .chaos/framework/order/STOP
 /loop --queue  # Continue from where it stopped
 ```
 

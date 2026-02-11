@@ -1,0 +1,100 @@
+# ORDER Configuration v2.0.0
+#
+# Safety limits and behavior settings for autonomous task execution.
+
+# Safety limits - hard stops that cannot be exceeded
+safety:
+  max_iterations: 100          # Stop after N tasks processed
+  max_time_hours: 24           # Stop after N hours
+  max_consecutive_failures: 10 # Stop after N failures in a row
+  max_pr_age_hours: 24         # Flag PRs open longer than this
+  max_concurrent_prs: 10       # Warn if too many PRs open
+
+# PR workflow settings
+pr_workflow:
+  order_review: false          # CHAOS /pr-monitor handles full PR lifecycle
+  gha_wait_timeout_minutes: 30 # How long to wait for GHA review
+  merge_method: squash         # squash | merge | rebase
+  delete_branch: true          # Delete branch after merge
+  post_merge_learn: true       # Run /learn after each merge
+
+# Task decomposition settings (for /plan-work)
+task_decomposition:
+  target_pr_size_loc: 400      # Target LOC per PR
+  max_pr_size_loc: 800         # Maximum LOC per PR
+
+# Behavior settings
+behavior:
+  on_unresolvable: skip        # skip | halt
+  auto_commit: true            # Commit after each successful task
+  branch_prefix: task/         # Git branch prefix for changes
+  dry_run: false               # Simulate without making changes
+
+# Autonomous task generation (for /loop --auto)
+autonomous:
+  enabled: false               # Set to true to enable auto mode
+
+  # Health thresholds (must pass before new features)
+  health_gates:
+    min_test_coverage: 70      # Percentage
+    max_critical_issues: 0     # Security/critical bugs
+    max_high_issues: 5         # High-severity tech debt
+
+  # What ORDER can generate
+  allow_feature_specs: false   # Only improvements until healthy
+  improvement_categories:
+    - tech_debt
+    - test_coverage
+    - security
+    - performance
+
+# Roadmap-driven workflow
+roadmap:
+  path: docs/ROADMAP.md           # Path to roadmap file
+  spec_dir: specs/                # Where to write specs
+  checkpoint_on_step: true        # Create handoff after each step
+  auto_advance: true              # Automatically move to next step after completion
+
+# Contract enforcement
+contracts:
+  spec_contract_required: true           # Reject specs missing required sections
+  beads_contract_required: true          # Reject tasks missing required fields
+  pr_gates_required: true                # Enforce all PR merge gates
+  completion_gates_required: true        # Enforce all completion gates
+  max_acceptance_criteria_per_task: 3    # Hard limit on task scope
+
+# Polling configuration
+polling:
+  beads_check_interval_seconds: 120     # How often ORDER checks Beads
+  pr_monitor_interval_seconds: 120      # How often CHAOS checks GHA
+  max_poll_iterations: 1000             # Safety limit for infinite loops
+  escalation_max_iterations: 10         # Max PR feedback cycles before escalating
+
+  # NOTE: Polling-based monitoring (Beads, PR status) is a Phase 1
+  # simplification. Future versions may replace polling with event-driven
+  # hooks (GitHub webhooks, Beads callbacks) without altering system contracts.
+  # The contract layer is intentionally decoupled from the transport layer.
+  implementation_phase: 1
+
+# ORDER-to-ORDER handoff
+handoff:
+  enabled: true                        # Enable ORDER-to-ORDER handoff
+  handoff_dir: .chaos/framework/order/handoffs/  # Where to store handoff documents
+  preserve_logs: true                  # Keep old instance logs
+  schema_validation: strict            # Reject malformed handoff files
+
+# Lifecycle state machine
+lifecycle:
+  enforce_state_machine: true          # Prevent state transitions from being skipped
+  state_file: .chaos/framework/order/state.json  # Where to track lifecycle state
+
+# Orchestrator settings (for /order-run)
+orchestrator:
+  max_spec_revisions: 3          # Max create-spec/review-spec cycles before arbiter
+  execution_mode: sequential     # Tasks execute one at a time, each merged before the next begins
+
+# Notification (future)
+notify:
+  on_complete: false
+  on_failure: false
+  webhook_url: null

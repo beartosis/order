@@ -1,0 +1,259 @@
+---
+name: plan-work
+description: |
+  Decompose a Spec Contract into PR-sized tasks in sequential order.
+  Creates Beads Issue Contracts for each task.
+  Writes task queue for sequential execution (one task at a time).
+argument-hint: "<spec-path>"
+disable-model-invocation: true
+allowed-tools: Read, Grep, Glob, Bash, Task, Write, TodoWrite
+---
+
+# Plan Work: Spec Contract Decomposition into Beads Issue Contracts
+
+Break a Spec Contract (created by /create-spec from a roadmap step) into PR-sized tasks (~400 LOC each), create Beads Issue Contracts with required fields, and build a dependency-ordered task queue.
+
+## Entry Point
+
+```
+/plan-work specs/my-feature/SPEC.md
+```
+
+---
+
+## Step 1: Read Spec
+
+```bash
+SPEC_PATH="$ARGUMENTS"
+
+# Read the spec
+cat "$SPEC_PATH"
+
+# Read project standards
+cat standards/standards.yml
+```
+
+Parse:
+- **Goal**: What the spec achieves
+- **Acceptance criteria**: What "done" means
+- **Dependencies**: External requirements
+- **Scope**: Files and systems affected
+
+### State Machine Validation
+
+```bash
+# Must be in REVIEW_SPEC state (spec has been reviewed and approved)
+CURRENT_STATE=$(cat .chaos/framework/order/state.json | jq -r '.current_state // "INIT"')
+if [[ "$CURRENT_STATE" != "REVIEW_SPEC" && "$CURRENT_STATE" != "INIT" ]]; then
+  echo "ERROR: Cannot plan work in state $CURRENT_STATE"
+  echo "Expected: REVIEW_SPEC (spec must be reviewed first)"
+  exit 1
+fi
+```
+
+### Validate Spec Contract
+
+The spec must conform to the required Spec Contract format. Reject if any required section is missing:
+- Step Reference, Purpose, In Scope, Out of Scope, Constraints
+- Required Interfaces, Technical Approach, Risks, Acceptance Criteria, Decomposition Notes
+
+```bash
+# Verify all required sections exist
+for section in "Step Reference" "Purpose" "In Scope" "Out of Scope" "Constraints" \
+               "Required Interfaces" "Technical Approach" "Risks" "Acceptance Criteria" "Decomposition Notes"; do
+  if ! grep -q "## $section" "$SPEC_PATH"; then
+    echo "FATAL: Spec Contract missing required section: $section"
+    echo "Spec must be created by /create-spec and reviewed by /review-spec"
+    exit 1
+  fi
+done
+```
+
+---
+
+## Step 2: Explore Codebase
+
+Understand the codebase to inform decomposition:
+
+```bash
+# Find files related to the spec's domain
+grep -r "[relevant patterns]" src/ --files-with-matches
+
+# Check existing test patterns
+ls tests/
+
+# Estimate codebase size for reference
+find src/ -name "*.ts" -o -name "*.js" -o -name "*.py" | xargs wc -l | tail -1
+```
+
+Key questions for decomposition:
+- What existing code can be reused or extended?
+- What new modules/files are needed?
+- What's the natural dependency order?
+
+If sizing is ambiguous, invoke `/order-oracle` for decisions:
+
+```
+/order-oracle "How should we split [spec] given [codebase context]?"
+```
+
+The oracle will analyze the codebase and return a decision with evidence.
+
+---
+
+## Step 3: Decompose into Tasks
+
+Break the spec into PR-sized tasks:
+
+**Sizing targets**:
+- Target: ~400 lines of code changed per task
+- Maximum: ~800 lines per task
+- Minimum: 1 meaningful unit of work
+
+**Task structure**:
+Each task must have:
+- A clear, single-purpose goal
+- Well-defined acceptance criteria (subset of spec criteria)
+- List of files it will modify/create
+- Dependencies on other tasks (if any)
+
+**Ordering rules** (sequential execution — NO parallel waves):
+- Tasks are ordered by execution sequence in the queue
+- Each task builds on the **merged result** of all previous tasks
+- Earlier tasks are merged into main before later tasks begin
+- Minimize file overlap between tasks. When overlap is unavoidable, the later task must be designed to layer on top of the earlier task's changes
+- Every task creates exactly 1 PR — tasks must NEVER be combined into shared branches
+
+### Beads Issue Contract Format
+
+Each task must be created as a Beads Issue Contract with these required fields:
+
+```yaml
+task_id: step-{N}-task-{M}
+spec_id: step-{N}-{slug}
+spec_path: specs/step-{N}-{slug}/SPEC.md
+acceptance_criteria:           # 1-3 max, copied verbatim from spec
+  - "Functional condition X"
+  - "Test for condition X exists"
+files_likely:                  # Advisory, not enforced — best guess
+  - "internal/module/file.go"
+tests_required:                # Specific test files/functions
+  - "internal/module/file_test.go"
+dependencies:                  # Other task_ids that must complete first (implicit from order)
+  - "step-{N}-task-{K}"
+in_scope:                      # Inherited from spec, narrowed to this task
+  - "Specific behavior for this task"
+out_of_scope:                  # Inherited from spec + task-specific exclusions
+  - "Everything not in acceptance_criteria"
+complexity: XS                 # Task-level complexity (XS/S/M/L)
+```
+
+**Rules**:
+- Each Beads issue maps to **1-3 acceptance criteria max**
+- CHAOS may not add scope beyond acceptance criteria
+- `files_likely` is advisory — CHAOS may touch other files if needed
+- Claude GHA checks Beads issue to PR alignment
+
+---
+
+## Step 4: Create Tracking Issues
+
+For each task, create a Beads Issue Contract with all required fields:
+
+```bash
+bd create --title "Task: [task-title]" --type task \
+  --note "task_id: step-{N}-task-{M}
+spec_id: step-{N}-{slug}
+spec_path: $SPEC_PATH
+acceptance_criteria:
+  - [criteria from spec]
+complexity: {XS/S/M/L}"
+```
+
+**Do NOT create GitHub Issues.** Beads is the sole issue tracker for this project.
+
+Record the Beads issue ID for each task.
+
+---
+
+## Step 5: Write Task Queue
+
+Write the task queue in sequential execution order:
+
+```bash
+cat > .chaos/framework/order/queue.txt << 'EOF'
+# ORDER Task Queue v2.0
+# Format: <task-id>|bd:<beads-id>
+#
+# Generated from: $SPEC_PATH
+# Generated at: $(date -Iseconds)
+#
+# Tasks execute sequentially: each task is worked, its PR merged,
+# and main pulled before the next task begins.
+#
+[task entries in execution order]
+EOF
+```
+
+**Format per line**:
+```
+task-short-name|bd:ABC123
+task-that-depends|bd:DEF456
+```
+
+---
+
+## Step 5.5: Update State and Write Result
+
+```bash
+# Update state.json to PLAN_WORK and write last_result for orchestrator
+TASK_COUNT=$(grep -v '^#' .chaos/framework/order/queue.txt | grep -v '^$' | wc -l)
+cat .chaos/framework/order/state.json | jq \
+  --arg state "PLAN_WORK" \
+  --arg time "$(date -Iseconds)" \
+  --arg skill "plan-work" \
+  --arg verdict "TASKS_CREATED" \
+  --argjson task_count "$TASK_COUNT" \
+  '.current_state = $state | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}] | .last_result = {skill: $skill, verdict: $verdict, task_count: $task_count}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+---
+
+## Step 6: Output Summary
+
+```markdown
+## Plan Work Complete
+
+**Spec**: $SPEC_PATH
+**Tasks**: [N] tasks (sequential execution)
+
+### Task Table
+
+| # | Task | Deps | Est. LOC | Beads |
+|---|------|------|----------|-------|
+| 1 | [name] | none | ~300 | ABC123 |
+| 2 | [name] | 1 | ~400 | DEF456 |
+| 3 | [name] | 1,2 | ~350 | GHI789 |
+
+### Execution Order
+
+Tasks execute one at a time. Each task's PR is merged before the next begins.
+
+### Next Steps
+
+The ORDER loop will execute tasks sequentially.
+```
+
+---
+
+## CRITICAL Rules
+
+1. **Target ~400 LOC per task** - Smaller PRs are easier to review
+2. **Max ~800 LOC per task** - Larger tasks should be split further
+3. **Beads only** - Do NOT create GitHub Issues; Beads is the sole tracker
+4. **Sequential order matters** - Tasks execute one at a time; order them by dependency
+5. **1 task = 1 PR** - Every task creates exactly one branch and one PR. Never combine tasks.
+6. **Minimize file overlap** - Each task should own specific files. Later tasks layer on earlier merged results.
+7. **Each task must be independently testable** - No half-working states
+8. **Write queue.txt in execution order** - The loop processes tasks top to bottom

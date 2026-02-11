@@ -1,0 +1,142 @@
+---
+name: parse-roadmap
+description: |
+  Parse the project roadmap and identify the next uncompleted step.
+  Returns step details for spec creation.
+  INTERNAL - called by ORDER main loop.
+disable-model-invocation: true
+allowed-tools: Read, Grep, Bash
+---
+
+# Parse Roadmap: Extract Next Step
+
+Read the project roadmap and identify the next uncompleted step for spec creation.
+
+## Arguments
+
+None (reads roadmap automatically).
+
+## Workflow
+
+### Step 1: Validate State Machine
+
+```bash
+CURRENT_STATE=$(cat .chaos/framework/order/state.json | jq -r '.current_state // "INIT"')
+if [[ "$CURRENT_STATE" != "INIT" && "$CURRENT_STATE" != "PARSE_ROADMAP" ]]; then
+  echo "ERROR: Cannot parse roadmap in state $CURRENT_STATE"
+  echo "Expected: INIT or PARSE_ROADMAP"
+  exit 1
+fi
+```
+
+### Step 2: Read Roadmap
+
+```bash
+cat docs/ROADMAP.md
+```
+
+Parse the roadmap structure:
+- Phase headers: `## Phase N: Title (M specs)`
+- Step lines: `N. [X] Title — Description \`Complexity\``
+- Checkbox states: `[ ]` uncompleted, `[S]` spec created, `[T]` tasks created, `[X]` complete
+
+### Step 3: Find Next Uncompleted Step
+
+Scan all steps in order. Find the first step with `[ ]` (uncompleted checkbox).
+
+```bash
+# Find first uncompleted step
+grep -n '^\d\+\. \[ \]' docs/ROADMAP.md | head -1
+```
+
+If no uncompleted steps remain, return `ROADMAP_COMPLETE`.
+
+### Step 4: Extract Step Details
+
+From the matched line, extract:
+- **Step number**: The leading number
+- **Title**: Text between `] ` and ` — `
+- **Description**: Text between ` — ` and the backtick-wrapped complexity
+- **Complexity**: The complexity rating (XS, S, M, L) in backticks
+
+### Step 5: Check for Existing Spec
+
+```bash
+# Check if spec already exists for this step
+STEP_NUM=<extracted step number>
+ls specs/step-${STEP_NUM}-*/SPEC.md 2>/dev/null
+```
+
+If spec exists, return `SPEC_EXISTS` with the path.
+
+### Step 6: Extract Phase Context
+
+Determine which phase this step belongs to by reading backwards from the step line to find the nearest `## Phase` header.
+
+### Step 7: Update State
+
+```bash
+# Update state.json
+cat .chaos/framework/order/state.json | jq \
+  --arg state "PARSE_ROADMAP" \
+  --arg step "$STEP_NUM" \
+  --arg time "$(date -Iseconds)" \
+  '.current_state = $state | .step_number = ($step | tonumber) | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}]' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+### Step 8: Write Structured Result to state.json
+
+Write a `last_result` object so the `/order-run` orchestrator can read the verdict without parsing output text.
+
+If a step was found:
+```bash
+# Write last_result for orchestrator
+cat .chaos/framework/order/state.json | jq \
+  --arg skill "parse-roadmap" \
+  --arg verdict "STEP_FOUND" \
+  --argjson step "$STEP_NUM" \
+  --arg title "$TITLE" \
+  '.last_result = {skill: $skill, verdict: $verdict, step_number: $step, title: $title}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+If all steps are complete:
+```bash
+# Write last_result for orchestrator
+cat .chaos/framework/order/state.json | jq \
+  --arg skill "parse-roadmap" \
+  --arg verdict "ROADMAP_COMPLETE" \
+  '.last_result = {skill: $skill, verdict: $verdict}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+### Step 9: Output
+
+```markdown
+## Next Roadmap Step
+
+**Step**: {number}
+**Title**: {title}
+**Description**: {description}
+**Complexity**: {XS/S/M/L}
+**Phase**: {phase number} - {phase name}
+**State**: PARSE_ROADMAP
+
+### Next Action
+Run `/create-spec {step-number}` to create the Spec Contract.
+```
+
+## Special Cases
+
+- **ROADMAP_COMPLETE**: All steps have `[X]` — roadmap is fully implemented
+- **SPEC_EXISTS**: Step already has a spec — suggest `/review-spec` or `/plan-work`
+- **Dependencies**: Check if prerequisite steps (lower numbers) are complete
+
+## CRITICAL Rules
+
+1. **Always validate state machine** — Reject if not in valid state
+2. **Parse complexity rating** — XS/S/M/L for planning guidance
+3. **Return phase context** — Needed for handoff documentation
+4. **Check for existing specs** — Don't duplicate work
+5. **First `[ ]` only** — Always return the first uncompleted step

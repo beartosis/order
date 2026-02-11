@@ -1,0 +1,181 @@
+---
+name: verify-completion
+description: |
+  Verify all completion gates for a roadmap step before allowing
+  progression to handoff. Prevents implicit/premature completion.
+  All gates are binary and machine-verifiable.
+argument-hint: "<step-number>"
+disable-model-invocation: true
+allowed-tools: Read, Grep, Bash
+---
+
+# Verify Completion: Explicit Completion Gates
+
+Verify all completion gates for a roadmap step before allowing progression to handoff. All gates are binary and machine-verifiable — no subjective judgment.
+
+## Arguments
+
+Step number: `$ARGUMENTS`
+
+## Workflow
+
+### Step 1: Parse Step Number
+
+```bash
+STEP_NUM="$ARGUMENTS"
+if [ -z "$STEP_NUM" ]; then
+  echo "Usage: /verify-completion <step-number>"
+  exit 1
+fi
+```
+
+### Step 2: Load Spec Contract
+
+```bash
+# Find the spec for this step
+SPEC_DIR=$(ls -d specs/step-${STEP_NUM}-* 2>/dev/null | head -1)
+if [ -z "$SPEC_DIR" ]; then
+  echo "ERROR: No spec found for step $STEP_NUM"
+  exit 1
+fi
+SPEC_PATH="$SPEC_DIR/SPEC.md"
+cat "$SPEC_PATH"
+```
+
+### Step 3: Run Completion Gates
+
+#### Gate 1: Issues Closed (BLOCKING)
+
+```bash
+# Check all Beads issues for this spec are closed
+bd list --tag "step-${STEP_NUM}" --status=open
+OPEN_COUNT=$?
+```
+
+All Beads issues for this spec must be closed.
+
+#### Gate 2: PRs Merged (BLOCKING)
+
+```bash
+# Check all related PRs are merged to main
+gh pr list --search "step-${STEP_NUM}" --state open --json number,title
+```
+
+All related PRs must be merged to main.
+
+#### Gate 3: Acceptance Criteria (BLOCKING)
+
+Read acceptance criteria from Spec Contract. Cross-reference with closed issues and merged PRs to verify each criterion was addressed.
+
+```bash
+# Extract acceptance criteria from spec
+grep '^\- \[ \]' "$SPEC_PATH"
+# Each should have been converted to [x] or addressed by a merged PR
+```
+
+All acceptance criteria from Spec Contract must be satisfied.
+
+#### Gate 4: Tests Pass (BLOCKING)
+
+```bash
+# Run full test suite on main
+git checkout main
+# Run project-specific test command (detect from Makefile, package.json, etc.)
+make test 2>&1 || go test ./... 2>&1 || npm test 2>&1
+TEST_EXIT=$?
+```
+
+Full test suite must pass on main.
+
+#### Gate 5: No GHA Warnings (BLOCKING)
+
+```bash
+# Check for open Claude GHA warnings on merged PRs
+gh pr list --search "step-${STEP_NUM}" --state merged --json number \
+  -q '.[].number' | while read PR; do
+  gh api repos/{owner}/{repo}/pulls/$PR/reviews \
+    --jq '.[] | select(.state == "CHANGES_REQUESTED")'
+done
+```
+
+No open Claude GHA warnings on merged PRs.
+
+#### Gate 6: Out-of-Scope Clean (ADVISORY)
+
+Check that no Out of Scope items from the spec were implemented. This is advisory — warn but don't block.
+
+### Step 4: Generate Gate Report
+
+```yaml
+step: {N}
+gates:
+  issues_closed: PASS | FAIL
+  prs_merged: PASS | FAIL
+  acceptance_criteria: PASS | FAIL
+  tests_pass: PASS | FAIL
+  no_gha_warnings: PASS | FAIL
+  out_of_scope_clean: PASS | WARN  # advisory
+verdict: COMPLETE | BLOCKED
+blockers:
+  - "{description of what failed}"
+advisories:
+  - "{description of advisory warnings}"
+```
+
+### Step 5: Update State and Write Result
+
+If COMPLETE:
+```bash
+# Update state.json and write last_result for orchestrator
+cat .chaos/framework/order/state.json | jq \
+  --arg state "VERIFY_COMPLETION" \
+  --arg time "$(date -Iseconds)" \
+  --arg skill "verify-completion" \
+  --arg verdict "COMPLETE" \
+  '.current_state = $state | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}] | .last_result = {skill: $skill, verdict: $verdict}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+
+# Mark roadmap step as complete
+sed -i "s/^${STEP_NUM}\. \[.\]/\${STEP_NUM}. [X]/" docs/ROADMAP.md
+
+echo "All gates PASS. Run: /handoff $STEP_NUM"
+```
+
+If BLOCKED:
+```bash
+# Write last_result with blocker details for orchestrator
+# Collect blockers from the gate report above
+cat .chaos/framework/order/state.json | jq \
+  --arg skill "verify-completion" \
+  --arg verdict "BLOCKED" \
+  --argjson blockers '["blocker1", "blocker2"]' \
+  '.last_result = {skill: $skill, verdict: $verdict, blockers: $blockers}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+
+echo "Completion BLOCKED. Address blockers above."
+# State remains in EXECUTE_TASKS
+```
+
+> **Design note**: "In-Scope Verified" is intentionally absent as a gate. It is redundant with Acceptance Criteria — if all acceptance criteria pass, In Scope is satisfied by definition.
+
+---
+
+## Completion Gates Reference
+
+| Gate | Check | Type | Fail Action |
+|------|-------|------|-------------|
+| **Issues Closed** | All Beads issues for this spec are closed | BLOCKING | Report open issues |
+| **PRs Merged** | All related PRs are merged to main | BLOCKING | Report unmerged PRs |
+| **Acceptance Criteria** | All acceptance criteria from Spec Contract satisfied | BLOCKING | Report unmet criteria |
+| **Tests Pass** | Full test suite passes on main | BLOCKING | Report failures |
+| **No GHA Warnings** | No open Claude GHA warnings on merged PRs | BLOCKING | Report warnings |
+| **Out-of-Scope Clean** | No Out of Scope items were implemented | ADVISORY | Warn, log for review |
+
+## CRITICAL Rules
+
+1. **All blocking gates must pass** — No exceptions
+2. **Binary checks only** — No subjective judgment
+3. **Machine-verifiable** — Every gate can be checked programmatically
+4. **Advisory gates don't block** — Warn but allow progression
+5. **Update roadmap on COMPLETE** — Mark `[X]`
+6. **Only COMPLETE allows /handoff** — Cannot skip verification

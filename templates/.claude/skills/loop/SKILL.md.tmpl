@@ -1,38 +1,40 @@
 ---
 name: loop
-description: Run specs autonomously without human intervention. Main entry point for ORDER.
-argument-hint: "[spec-name] | --queue | --auto [--dry-run]"
+description: |
+  Run tasks autonomously without human intervention. Main entry point for ORDER.
+  Spawns CHAOS /work instances and manages autonomous task execution with roadmap integration.
+argument-hint: "[task-id] | --queue | --auto [--dry-run]"
 disable-model-invocation: true
 allowed-tools: Read, Grep, Glob, Bash, Task, Write, TodoWrite
 ---
 
-# Loop: Autonomous Spec Execution
+# Loop: Autonomous Task Execution
 
-Execute specs without human intervention using ORDER agents.
+Execute tasks sequentially without human intervention. For each task: spawn CHAOS `/work`, monitor PR via CHAOS `/pr-monitor`, and learn. CHAOS handles the full PR feedback loop autonomously.
 
 ## Modes
 
-### Single Spec Mode
+### Single Task Mode
 ```
-/loop 2025-02-03-my-feature
+/loop my-task-name
 ```
-Process a single spec autonomously.
+Process a single task autonomously.
 
 ### Queue Mode
 ```
 /loop --queue
 ```
-Process all specs listed in `.CHAOS/order/queue.txt`.
+Process all tasks listed in `.chaos/framework/order/queue.txt`.
 
 ### Autonomous Mode
 ```
 /loop --auto
 ```
-Generate specs from codebase analysis and execute them.
+Generate tasks from codebase analysis and execute them.
 
 ### Dry Run
 ```
-/loop --dry-run [spec-name]
+/loop --dry-run [task-id]
 /loop --queue --dry-run
 ```
 Simulate execution without making changes.
@@ -45,79 +47,101 @@ Simulate execution without making changes.
 
 ```bash
 # Create/update state file
-cat > .CHAOS/order/state.json << 'EOF'
+cat > .chaos/framework/order/state.json << 'EOF'
 {
   "status": "running",
   "started_at": "$(date -Iseconds)",
-  "current_spec": null,
+  "current_task": null,
   "iteration": 0,
   "completed": [],
   "failed": [],
   "skipped": [],
-  "estimated_cost_dollars": 0,
-  "consecutive_failures": 0
+  "consecutive_failures": 0,
+  "prs": {}
 }
 EOF
+```
+
+### Step 1.5: Validate Lifecycle State
+
+```bash
+# Verify we're in a valid state for task execution
+CURRENT_STATE=$(cat .chaos/framework/order/state.json | jq -r '.current_state // "INIT"')
+if [[ "$CURRENT_STATE" != "EXECUTE_TASKS" && "$CURRENT_STATE" != "INIT" ]]; then
+  echo "ERROR: Cannot execute tasks in state $CURRENT_STATE"
+  echo "Expected: EXECUTE_TASKS or INIT"
+  exit 1
+fi
 ```
 
 ### Step 2: Load Configuration
 
 ```bash
-cat .CHAOS/order/config.yml
+cat .chaos/framework/order/config.yml
 ```
 
 Check safety limits:
 - `max_iterations`
 - `max_time_hours`
-- `max_cost_dollars`
 - `max_consecutive_failures`
 
-### Step 3: Build Spec Queue
+### Step 3: Build Task Queue
 
-**Single spec**: Queue contains just the specified spec
+**Single task**: Queue contains just the specified task
 
-**Queue mode**: Read from `.CHAOS/order/queue.txt`
+**Queue mode**: Read from `.chaos/framework/order/queue.txt`
 ```bash
-grep -v '^#' .CHAOS/order/queue.txt | grep -v '^$'
+# v2 format: task-id|wave:N|deps:[...]|bd:ID
+grep -v '^#' .chaos/framework/order/queue.txt | grep -v '^$'
 ```
 
 **Auto mode**:
-1. Launch `code-explorer` for codebase analysis
-2. Launch `order-oracle` to prioritize and generate specs
-3. Add generated specs to queue
+1. Explore codebase for improvement opportunities
+2. Invoke `/order-oracle` to prioritize and create tasks
+3. Use `/plan-work` to decompose into queue
 
 ### Step 4: Process Loop
 
-For each spec in queue:
+For each task in queue (respecting wave order):
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  1. SENTINEL CHECK                                       │
-│     └─► Launch order-sentinel                           │
-│         └─► If STOP: exit loop                          │
-│                                                          │
-│  2. UPDATE STATE                                         │
-│     └─► Set current_spec, increment iteration           │
-│                                                          │
-│  3. ORCHESTRATE (with ORDER agents)                     │
-│     └─► /orchestrate [spec-name]                        │
-│         ├─► order-oracle answers questions              │
-│         └─► order-arbiter handles failures              │
-│                                                          │
-│  4. RECORD RESULT                                        │
-│     ├─► Success: Add to completed[], reset failures     │
-│     ├─► Skip: Add to skipped[], continue                │
-│     └─► Fail: Add to failed[], increment failures       │
-│                                                          │
-│  5. LOG TO BEADS                                         │
-│     └─► bd update with result summary                   │
-│                                                          │
-│  6. CHECK BEHAVIOR                                       │
-│     └─► If failure and on_unresolvable=halt: exit      │
-│                                                          │
-│  7. CONTINUE                                             │
-│     └─► Next spec in queue                              │
-└─────────────────────────────────────────────────────────┘
++-----------------------------------------------------------+
+|  1. SENTINEL CHECK                                         |
+|     > bash .claude/scripts/sentinel-check.sh              |
+|       > If exit 1 (STOP): exit loop                       |
+|                                                            |
+|  2. UPDATE STATE                                           |
+|     > Set current_task, increment iteration               |
+|                                                            |
+|  3. SPAWN CHAOS /work                                      |
+|     > claude -p "/work <task-id>"                         |
+|       --dangerously-skip-permissions                      |
+|       --model sonnet                                      |
+|     > CHAOS: reads task, explores, implements,            |
+|       self-checks, pushes draft PR                        |
+|                                                            |
+|  4. PR LIFECYCLE (CHAOS autonomous)                        |
+|     > CHAOS /pr-monitor handles full PR feedback loop     |
+|     > Polls GHA every 2 min, addresses feedback           |
+|     > Merges when all gates pass                          |
+|                                                            |
+|  8. POST-MERGE LEARN                                       |
+|     > Spawn: claude -p "/learn" (if configured)           |
+|                                                            |
+| 8.5 PULL MAIN                                              |
+|     > git pull origin main (keep local up to date)        |
+|                                                            |
+|  9. RECORD RESULT                                          |
+|     > Success: Add to completed[], reset failures         |
+|     > Skip: Add to skipped[], continue                    |
+|     > Fail: Add to failed[], increment failures           |
+|                                                            |
+| 10. LOG TO BEADS                                           |
+|     > bd update with result summary                       |
+|                                                            |
+| 11. CONTINUE                                               |
+|     > Next task in queue                                  |
++-----------------------------------------------------------+
 ```
 
 ### Step 5: Completion
@@ -132,33 +156,119 @@ bd sync --flush-only
 # Report summary
 ```
 
+### Step 5.5: Write Structured Result to state.json
+
+```bash
+# Count completed and failed tasks
+COMPLETED=$(cat .chaos/framework/order/state.json | jq '.completed | length')
+FAILED=$(cat .chaos/framework/order/state.json | jq '.failed | length')
+
+if [ "$FAILED" -eq 0 ]; then
+  VERDICT="TASKS_COMPLETE"
+else
+  VERDICT="TASKS_FAILED"
+fi
+
+# Write last_result for orchestrator
+cat .chaos/framework/order/state.json | jq \
+  --arg state "EXECUTE_TASKS" \
+  --arg time "$(date -Iseconds)" \
+  --arg skill "loop" \
+  --arg verdict "$VERDICT" \
+  --argjson failures "$FAILED" \
+  '.current_state = $state | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}] | .last_result = {skill: $skill, verdict: $verdict, failures: $failures}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+### Step 5.75: Verify Completion and Handoff
+
+When all tasks in the queue complete successfully:
+
+```bash
+# Verify all completion gates pass
+/verify-completion <step-number>
+
+# If COMPLETE: create handoff for next ORDER instance
+/handoff <step-number>
+```
+
+> Only trigger handoff when `/verify-completion` returns COMPLETE.
+
 ---
 
-## Agent Integration
+## Spawning CHAOS /work
 
-### order-sentinel (before each spec)
+```bash
+TASK_ID="my-task-name"
+RUN_DIR=".chaos/framework/runs/$TASK_ID"
+mkdir -p "$RUN_DIR"
+
+# Spawn CHAOS developer instance
+claude -p "/work $TASK_ID" \
+  --dangerously-skip-permissions \
+  --model sonnet \
+  > "$RUN_DIR/output.log" 2>&1
+EXIT_CODE=$?
+
+# Run post-task hook to capture results and update state
+bash .claude/scripts/post-task-hook.sh "$TASK_ID" "$EXIT_CODE"
+
+# Extract PR number
+PR_NUM=$(gh pr list --head "task/$TASK_ID" --json number -q '.[0].number')
+echo "$PR_NUM" > "$RUN_DIR/pr_number"
 ```
-Task(order-sentinel, run_in_background: true):
-  Check all safety limits
-  Return: CONTINUE or STOP with reason
+
+---
+
+## PR Lifecycle
+
+### After /work completes
+```bash
+# 1. Find the draft PR
+PR_NUM=$(cat "$RUN_DIR/pr_number")
+
+# 2. CHAOS /pr-monitor handles full PR lifecycle autonomously
+#    - Polls GHA every 2 minutes
+#    - Addresses review feedback
+#    - Merges when all gates pass (GHA approved, checklist complete, tests green)
+
+# 3. Post-merge learning
+claude -p "/learn" \
+  --dangerously-skip-permissions \
+  --model sonnet \
+  > "$RUN_DIR/learn.log" 2>&1
 ```
 
-### order-oracle (during orchestration)
-Automatically intercepts `AskUserQuestion` calls from other agents.
-Makes decisions based on codebase analysis.
+> **Note**: ORDER no longer reviews PRs directly. CHAOS `/pr-monitor` handles the full PR feedback loop autonomously. GHA must approve via CHAOS `/pr-monitor` before merge.
 
-### order-arbiter (on 3rd failure)
-Replaces `dispute-resolver` behavior.
-Never escalates - decides RETRY, REDUCE_SCOPE, SKIP, or HALT.
+---
+
+## Internal Skill Integration
+
+### Sentinel check (before each task)
+```bash
+# Run safety checks — exits 0 (CONTINUE) or 1 (STOP)
+bash .claude/scripts/sentinel-check.sh
+```
+
+### /order-oracle (during planning)
+Invoke /order-oracle to answer sizing and decomposition questions when using auto mode.
+
+### /order-arbiter (on task failure)
+Invoke /order-arbiter when a task fails after retries:
+- RETRY: Spawn `/work` again with different guidance
+- REDUCE_SCOPE: Simplify the task and retry
+- SKIP: Mark task as skipped, continue queue
+- HALT: Stop the loop
 
 ---
 
 ## Dry Run Mode
 
 When `--dry-run` is specified:
-- Read specs and validate them
+- Read tasks and validate them
 - Run sentinel checks
-- Simulate orchestration decisions
+- Simulate spawning decisions
 - Log what WOULD happen
 - Make NO code changes
 - Make NO git commits
@@ -169,18 +279,23 @@ When `--dry-run` is specified:
 
 ### During Execution
 ```
-ORDER Loop: Processing 2025-02-03-feature (3 of 10)
-├─ Sentinel: OK (iter 3/100, 1h 23m/24h, $4.20/$50)
-├─ Orchestrate: Running...
-│  ├─ oracle: Decided "use Redis" (HIGH confidence)
-│  └─ arbiter: N/A (no failures)
-└─ Result: COMPLETED
+ORDER Loop: Processing my-task (3 of 10)
++- Sentinel: OK (iter 3/100, 1h 23m/24h)
++- Spawning: claude -p "/work my-task" ...
++- /work complete: Draft PR #42 created
++- /pr-monitor #42: GHA APPROVED, all gates pass
++- Merged: PR #42
++- /learn: Captured 2 observations
++- Result: COMPLETED
 
-ORDER Loop: Processing 2025-02-03-api-refactor (4 of 10)
-├─ Sentinel: OK
-├─ Orchestrate: FAILED (attempt 3)
-│  └─ arbiter: SKIP - external dependency unavailable
-└─ Result: SKIPPED
+ORDER Loop: Processing api-refactor (4 of 10)
++- Sentinel: OK
++- Spawning: claude -p "/work api-refactor" ...
++- /work complete: Draft PR #43 created
++- /pr-monitor #43: GHA feedback addressed, re-polling...
++- /pr-monitor #43: GHA APPROVED, all gates pass
++- Merged: PR #43
++- Result: COMPLETED
 ```
 
 ### Final Summary
@@ -188,22 +303,27 @@ ORDER Loop: Processing 2025-02-03-api-refactor (4 of 10)
 ## ORDER Loop Complete
 
 **Duration**: 2h 34m
-**Specs Processed**: 10
-**Estimated Cost**: $12.40
+**Tasks Processed**: 10
+**PRs Merged**: 8
 
-| Status | Count | Specs |
+| Status | Count | Tasks |
 |--------|-------|-------|
-| Completed | 7 | feature, auth, ui, ... |
-| Skipped | 2 | api-refactor, legacy-fix |
+| Completed | 8 | feature, auth, ui, ... |
+| Skipped | 1 | api-refactor |
 | Failed | 1 | complex-migration |
 
+**PR Pipeline**:
+| PR# | Task | ORDER Review | GHA | Status |
+|-----|------|-------------|-----|--------|
+| #42 | feature | APPROVED | APPROVED | Merged |
+| #43 | auth | APPROVED | APPROVED | Merged |
+| #44 | migration | CHANGES_REQUESTED | - | Failed |
+
 **Arbiter Decisions**:
-- api-refactor: SKIP (external dependency)
-- legacy-fix: SKIP (ambiguous requirements)
 - complex-migration: HALT (data corruption risk)
 
 **Review Required**:
-- Check skipped specs in Beads audit trail
+- Check failed tasks in Beads audit trail
 - complex-migration needs human intervention
 ```
 
@@ -212,27 +332,25 @@ ORDER Loop: Processing 2025-02-03-api-refactor (4 of 10)
 ## Configuration Reference
 
 ```yaml
-# .CHAOS/order/config.yml
+# .chaos/framework/order/config.yml
 
 safety:
   max_iterations: 100
   max_time_hours: 24
-  max_cost_dollars: 50.00
   max_consecutive_failures: 10
+
+pr_workflow:
+  order_review: true
+  gha_wait_timeout_minutes: 30
+  merge_method: squash
+  delete_branch: true
+  post_merge_learn: true
 
 behavior:
   on_unresolvable: skip    # skip | halt
   auto_commit: true
-  branch_prefix: order/
+  branch_prefix: task/
   dry_run: false
-
-autonomous:
-  enabled: true
-  health_gates:
-    min_test_coverage: 70
-    max_critical_issues: 0
-    max_high_issues: 5
-  allow_feature_specs: false
 ```
 
 ---
@@ -240,8 +358,10 @@ autonomous:
 ## CRITICAL Rules
 
 1. **Always run sentinel first** - Safety checks are mandatory
-2. **Respect kill file** - Check `.CHAOS/order/STOP` exists
+2. **Respect kill file** - Check `.chaos/framework/order/STOP` exists
 3. **Log everything to Beads** - Audit trail required
 4. **Never skip sentinel** - Even in dry-run mode
 5. **Update state atomically** - Keep state.json consistent
-6. **Branch per spec** - Use `order/[spec-name]` branches
+6. **Branch per task** - Use `task/[task-name]` branches
+7. **GHA must approve** - via CHAOS /pr-monitor before merge
+8. **Post-merge /learn** - Capture observations after every merge

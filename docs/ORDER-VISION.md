@@ -1,70 +1,43 @@
 # ORDER: Optional Resource During Extended Runtimes
 
-**A plugin for CHAOS that enables autonomous, human-free operation.**
+**An Engineering Lead plugin for CHAOS v2 that manages task-based autonomous execution with PR lifecycle.**
 
 ---
 
 ## Vision
 
-CHAOS (Claude Handling Agentic Orchestration System) is designed with humans in the loop—writing specs, answering questions, resolving disputes. This is intentional: human oversight ensures quality and catches edge cases.
+CHAOS v2 treats each Claude Code conversation as a single professional developer. This developer reads tasks, explores code, implements changes, self-checks quality, and pushes draft PRs.
 
-But sometimes you want to let it run.
+ORDER v2 is the Engineering Lead who manages these developers.
 
-**ORDER** removes the human element, enabling CHAOS to operate in a self-sustaining loop. It's the difference between supervised and unsupervised execution:
+**ORDER** decomposes specs into PR-sized tasks, spawns CHAOS `/work` instances to implement them, reviews the resulting PRs, coordinates with GitHub Actions for automated review, and handles the merge lifecycle.
 
-| Mode | Human Role | Use Case |
-|------|-----------|----------|
-| **CHAOS** | Write specs, answer questions, resolve disputes | Active development, complex features |
-| **CHAOS + ORDER** | Queue specs, walk away | Batch processing, overnight runs, CI/CD |
-
-ORDER is **optional** and **additive**—it layers on top of CHAOS without modifying the core framework. Users explicitly opt into autonomous mode.
+| Mode | Developer Role | Lead Role |
+|------|---------------|-----------|
+| **CHAOS v2 alone** | Human gives tasks, reviews PRs | Human is the lead |
+| **CHAOS v2 + ORDER** | CHAOS `/work` implements tasks | ORDER manages lifecycle |
 
 ### Philosophy
 
 > *"From CHAOS comes ORDER"*
 
-- **Explicit opt-in**: ORDER must be installed separately; CHAOS remains human-in-the-loop by default
-- **Configurable autonomy**: Users control how aggressive ORDER is (skip failures vs halt)
-- **Safety first**: Hard limits on iterations, time, and cost prevent runaway execution
-- **Full audit trail**: All autonomous decisions logged to Beads for review
-- **Reversible**: Uninstall ORDER to restore standard CHAOS behavior
-- **Health before features**: Prioritize codebase quality over new functionality
+- **Explicit opt-in**: ORDER must be installed separately; CHAOS v2 remains standalone by default
+- **Task-based decomposition**: Specs break into ~400 LOC PR-sized tasks
+- **Dual review gate**: Both ORDER and GHA must approve before merge
+- **Self-reinforcing learning**: Post-merge `/learn` captures observations for future tasks
+- **Safety first**: Hard limits on iterations, time, PR pipeline depth
+- **Full audit trail**: All decisions logged to Beads and PR comments
+- **Reversible**: Uninstall ORDER to restore standalone CHAOS v2
 
 ### Health Before Features
 
 > *"Move slowly and fix things."*
 
-When operating autonomously, ORDER follows a discipline of codebase stewardship. Without human oversight, ORDER must be conservative about what it chooses to work on.
-
-**The Crawl-First Approach**:
+When operating autonomously, ORDER follows a discipline of codebase stewardship:
 
 1. **Is the codebase healthy?** Analyze for tech debt, test gaps, security issues.
 2. **Are existing features solid?** Fix bugs and shore up quality before adding complexity.
 3. **Is the foundation stable?** Reduce debt per release, not accumulate it.
-
-**The Improvement Cycle**:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                 ORDER IMPROVEMENT CYCLE                      │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│    Crawl ──► Identify ──► Fix ──► Crawl ──►                 │
-│       │                             │                        │
-│       └─── (only when healthy) ─────┴───► New Feature       │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**When ORDER proposes new features**:
-
-New feature specs should only be generated when:
-- Recent `code-explorer` analysis shows acceptable health score
-- Known tech debt is documented and tracked
-- Test coverage meets configured thresholds
-- Security scan shows no critical issues
-
-This isn't gatekeeping—it's sustainability. ORDER earns the right to add features by first proving the codebase is healthy.
 
 ---
 
@@ -72,522 +45,339 @@ This isn't gatekeeping—it's sustainability. ORDER earns the right to add featu
 
 ### Separate Repository
 
-ORDER lives in its own repository (`CHAOS-ORDER`), installed on top of an existing CHAOS installation:
+ORDER lives in its own repository, installed on top of an existing CHAOS v2 installation:
 
 ```
-~/CHAOS/           # Core framework (human-in-the-loop)
-~/CHAOS-ORDER/     # Plugin (autonomous mode)
+~/chaos/           # Core framework (single-developer paradigm)
+~/order/           # Plugin (Engineering Lead)
 ```
 
-This separation ensures:
-- CHAOS users aren't burdened with autonomous features they don't want
-- ORDER can version independently
-- Clear boundary between supervised and unsupervised operation
-
-### How ORDER Layers on CHAOS
+### How ORDER Layers on CHAOS v2
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    Your Project                      │
-├─────────────────────────────────────────────────────┤
-│  .claude/                                            │
-│  ├── agents/                                         │
-│  │   ├── [CHAOS agents]         ← Original          │
-│  │   ├── order-arbiter.md       ← ORDER override    │
-│  │   ├── order-oracle.md        ← ORDER addition    │
-│  │   └── order-sentinel.md      ← ORDER addition    │
-│  ├── skills/                                         │
-│  │   ├── [CHAOS skills]         ← Original          │
-│  │   ├── loop/                  ← ORDER addition    │
-│  │   └── order-status/          ← ORDER addition    │
-│  └── settings.local.json        ← Merged hooks      │
-├─────────────────────────────────────────────────────┤
-│  .CHAOS/                                             │
-│  ├── version                    ← CHAOS metadata    │
-│  ├── framework_path                                  │
-│  └── order/                     ← ORDER metadata    │
-│      ├── config.yml                                  │
-│      ├── queue.txt                                   │
-│      └── state.json                                  │
-└─────────────────────────────────────────────────────┘
++-----------------------------------------------------+
+|                    Your Project                      |
++-----------------------------------------------------+
+|  .claude/                                            |
+|  +-- skills/                                         |
+|  |   +-- [CHAOS v2 skills]   <-- work, self-check,  |
+|  |   |                           learn, review-      |
+|  |   |                           feedback, etc.      |
+|  |   +-- plan-work/          <-- ORDER skills        |
+|  |   +-- loop/                                       |
+|  |   +-- parallel/                                   |
+|  |   +-- work-wrapper/                               |
+|  |   +-- order-status/                               |
+|  |   +-- order-oracle/       <-- Internal (forked)   |
+|  |   +-- order-arbiter/      <-- Internal (forked)   |
+|  |   +-- parse-roadmap/      <-- Roadmap skills      |
+|  |   +-- create-spec/                                |
+|  |   +-- review-spec/        <-- Forked context      |
+|  |   +-- verify-completion/  <-- Verification        |
+|  |   +-- handoff/            <-- Lifecycle            |
+|  |   +-- order-resume/                               |
+|  |   +-- index.yml           <-- Merged (ORDER-      |
+|  |                               START/END markers)  |
+|  +-- scripts/                                        |
+|  |   +-- sentinel-check.sh   <-- Safety scripts      |
+|  |   +-- post-task-hook.sh                           |
+|  +-- settings.local.json     <-- From CHAOS v2       |
++-----------------------------------------------------+
+|  .chaos/                                              |
+|  +-- framework/              <-- CHAOS metadata       |
+|  |   +-- version                                      |
+|  |   +-- framework_path                               |
+|  |   +-- order/              <-- ORDER metadata       |
+|  |   |   +-- version                                  |
+|  |   |   +-- config.yml                               |
+|  |   |   +-- queue.txt                                |
+|  |   |   +-- state.json     <-- Lifecycle state       |
+|  |   |   +-- installed                                |
+|  |   |   +-- framework_path                           |
+|  |   |   +-- handoffs/      <-- Handoff documents     |
+|  |   |       +-- step-N_HANDOFF.yml                   |
+|  |   +-- runs/              <-- Per-task run dirs     |
+|  |       +-- <task-id>/                               |
+|  |           +-- status.json                          |
+|  |           +-- output.log                           |
+|  |           +-- pr_number                            |
+|  +-- learnings.md            <-- CHAOS v2 learning    |
+|  +-- learnings-archive/          system               |
++-------------------------------------------------------+
 ```
-
-### Escalation Point Interception
-
-CHAOS has three human escalation points. ORDER intercepts all of them:
-
-| Escalation Point | CHAOS Behavior | ORDER Behavior |
-|------------------|----------------|----------------|
-| **Spec clarification** | `spec-reviewer` asks human via `AskUserQuestion` | `order-oracle` analyzes codebase and decides |
-| **Spec creation** | `create-spec` has multi-round conversation with human | `code-explorer` + `order-oracle` generate specs autonomously |
-| **Third failure** | `dispute-resolver` escalates to human | `order-arbiter` tries alternative strategies, never escalates |
 
 ---
 
 ## Components
 
-### Agents
-
-#### `order-arbiter.md` — The Autonomous Dispute Resolver
-
-Replaces `dispute-resolver` with a version that **never escalates to humans**.
-
-**Model**: Sonnet
-
-**Strategies on failure**:
-1. **Retry with different approach** — Suggest alternative implementation path
-2. **Scope reduction** — Simplify requirements to unblock
-3. **Skip and continue** — Mark as unresolvable, move to next spec
-4. **Halt** — Stop the loop (if configured)
-
-**Key difference from `dispute-resolver`**:
-- No `AskUserQuestion` tool
-- Decision logged to Beads for audit
-- Configurable max retries before skip/halt
-
-#### `order-oracle.md` — The Autonomous Decision Maker
-
-Handles questions that `spec-reviewer` would ask humans.
-
-**Model**: Sonnet
-
-**How it decides**:
-1. Analyzes the codebase for patterns and conventions
-2. Looks at similar implementations
-3. Makes a reasonable decision based on evidence
-4. Documents the decision and rationale in Beads
-
-**Example**:
-```
-spec-reviewer asks: "Should errors be logged, shown to user, or both?"
-order-oracle analyzes: Found ErrorHandler class that logs + shows toast
-order-oracle decides: "Both - following existing ErrorHandler pattern"
-```
-
-#### `order-sentinel.md` — The Loop Controller
-
-Monitors autonomous execution and enforces safety limits.
-
-**Model**: Haiku (fast, cheap—runs frequently)
-
-**Responsibilities**:
-- Track iteration count, elapsed time, estimated cost
-- Check safety limits before each spec
-- Detect stuck/looping behavior
-- Trigger emergency stop if limits exceeded
-- Maintain state in `.CHAOS/order/state.json`
-
 ### Skills
 
-#### `/loop [spec-name]` — Main Entry Point
+#### `/plan-work <spec>` - Spec Decomposition
 
-The primary ORDER skill. Wraps `/orchestrate` in an autonomous loop.
+Breaks a spec into PR-sized tasks:
+1. Read spec and project standards
+2. Explore codebase for context
+3. Decompose into ~400 LOC tasks
+4. Create Beads + GitHub issues per task
+5. Write task queue with wave metadata
+6. Output summary table
 
-**Usage**:
-```bash
-# Process a single spec autonomously
-claude /loop 2025-02-03-my-feature
+#### `/loop [task-id | --queue | --auto]` - Sequential Execution
 
-# Process all specs in queue
-claude /loop --queue
+Main entry point. For each task:
+1. Sentinel safety check
+2. Spawn `claude -p "/work <task-id>"`
+3. `/review-pr <PR#>` after /work completes
+4. Wait for GHA review
+5. Handle feedback if needed (spawn `/review-feedback`)
+6. Merge PR
+7. Post-merge `/learn`
+8. Record result, continue
 
-# Dry run (no changes, just simulate)
-claude /loop --dry-run 2025-02-03-my-feature
-```
+#### `/parallel [--queue | --auto]` - Wave-Based Execution
 
-**Flow**:
-```
-/loop
-  │
-  ├─► Read queue from .CHAOS/order/queue.txt
-  │
-  ├─► For each spec:
-  │     │
-  │     ├─► order-sentinel checks safety limits
-  │     │
-  │     ├─► /orchestrate [spec] (with ORDER agents)
-  │     │     └─► order-oracle answers questions
-  │     │     └─► order-arbiter handles failures
-  │     │
-  │     ├─► Log result to Beads
-  │     │
-  │     └─► Continue or halt based on config
-  │
-  └─► Report summary
-```
+Parallel task execution respecting dependencies:
+1. Parse wave metadata from task queue
+2. For each wave: spawn all tasks simultaneously
+3. After wave: batch review, handle failures, batch merge
+4. Batch learn from all merged PRs
+5. Continue to next wave
 
-#### `/order-status` — Monitoring
+#### `/work-wrapper <task-id>` - Instance Manager (Internal)
 
-Check the state of an ORDER run.
+Thin wrapper for `/parallel` spawned instances:
+1. Write initial status.json
+2. Invoke CHAOS `/work`
+3. Extract PR number
+4. Write final status.json
 
-**Output**:
-```
-ORDER Status
-============
-State: RUNNING
-Current spec: 2025-02-03-user-auth
-Iteration: 7 of 100
-Elapsed: 2h 14m of 24h limit
-Estimated cost: $12.40 of $50.00 limit
-Specs completed: 3
-Specs failed: 1
-Specs remaining: 2
+#### `/order-status` - Monitoring
 
-Recent decisions (order-arbiter):
-  - 2025-02-03-api-refactor: SKIP (unresolvable after 5 retries)
-  - 2025-02-03-user-auth: RETRY (trying alternative approach)
-```
+Displays: task progress, PR pipeline table, agent decisions, health checks.
+
+### Internal Skills (Forked Context)
+
+#### `/order-oracle` - Autonomous Decision Maker
+
+**Model**: Sonnet | **Context**: Fork | **User-Invocable**: No
+
+Handles questions during execution:
+- Analyzes codebase patterns and project learnings
+- Makes evidence-based decisions
+- Assists `/plan-work` with task sizing
+- Documents decisions in Beads
+
+#### `/order-arbiter` - Failure Handler
+
+**Model**: Sonnet | **Context**: Fork | **User-Invocable**: No
+
+Handles task failures:
+- RETRY: Different approach with guidance
+- REDUCE_SCOPE: Simplify task
+- SKIP: Move to next task
+- HALT: Stop execution
+- PR-aware: factors in review state, GHA results
+
+### Roadmap Skills
+
+#### `/parse-roadmap` - Extract Next Step
+Reads `docs/ROADMAP.md`, finds first uncompleted `[ ]` step, extracts step number/title/description/complexity. Validates lifecycle state machine.
+
+#### `/create-spec` - Spec Contract Generation
+Expands a one-line roadmap step into a full Spec Contract. Explores codebase, reads standards and learnings, invokes `/order-oracle` for ambiguous decisions. Writes to `specs/step-{N}-{slug}/SPEC.md`.
+
+#### `/review-spec` - Spec Contract Validation
+**Context**: Fork (self-validation invariant)
+
+Reviews Spec Contract for completeness, feasibility, and quality. Validates all 10 required sections, checks content quality, verifies codebase references, and assesses feasibility. Returns READY or NEEDS_REVISION.
+
+### Verification & Lifecycle Skills
+
+#### `/verify-completion` - Completion Gate Enforcement
+Verifies 5 BLOCKING gates (Issues Closed, PRs Merged, Acceptance Criteria, Tests Pass, No GHA Warnings) + 1 ADVISORY gate (Out-of-Scope Clean). All binary and machine-verifiable.
+
+#### `/handoff` - ORDER-to-ORDER Transfer
+Creates structured YAML handoff document for ORDER instance transition. Captures decisions, outcomes, and next intent. No narrative prose, no PIDs.
+
+#### `/order-resume` - Resume from Handoff
+Validates handoff schema, verifies previous step complete, reads learnings, updates state to INIT, auto-invokes `/parse-roadmap`.
 
 ---
 
-## Autonomous Spec Generation
+## Lifecycle State Machine
 
-ORDER doesn't just execute pre-written specs—it can generate its own work.
-
-### How ORDER Finds Work
+ORDER's progression follows a strict state machine. Transitions must not be skipped.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│              AUTONOMOUS SPEC GENERATION                      │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  code-explorer crawls codebase                              │
-│         │                                                    │
-│         ▼                                                    │
-│  Identifies improvement opportunities:                       │
-│  ├─ Tech debt hotspots                                      │
-│  ├─ Test coverage gaps                                      │
-│  ├─ Security concerns                                       │
-│  └─ Performance issues                                      │
-│         │                                                    │
-│         ▼                                                    │
-│  order-oracle prioritizes based on:                         │
-│  ├─ Severity (critical > high > medium > low)               │
-│  ├─ Health-first policy (fixes before features)             │
-│  └─ Configuration thresholds                                │
-│         │                                                    │
-│         ▼                                                    │
-│  order-oracle generates spec (no human questions)           │
-│         │                                                    │
-│         ▼                                                    │
-│  Spec added to queue → /loop processes it                   │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
+INIT → PARSE_ROADMAP → CREATE_SPEC → REVIEW_SPEC → PLAN_WORK → EXECUTE_TASKS → VERIFY_COMPLETION → HANDOFF → EXIT
 ```
 
-### Generation Modes
+Each skill maps to one or more states. The state machine is tracked in `.chaos/framework/order/state.json`, which is the **authoritative** checkpoint for lifecycle progress.
 
-ORDER supports two modes of operation:
+### Authority & Responsibility Matrix
 
-| Mode | Trigger | Work Source |
-|------|---------|-------------|
-| **Queue mode** | `/loop --queue` | Process human-written specs from queue.txt |
-| **Autonomous mode** | `/loop --auto` | Generate specs from codebase analysis |
+| Actor | Owns | Must Not Do |
+|-------|------|-------------|
+| **Human** | Vision, Roadmap, Constraints | Write code, review PRs |
+| **ORDER** | Planning, Specs, Sequencing, Progression | Read PR diffs, review code |
+| **CHAOS** | Implementation, PR iteration, Merge | Change scope, reinterpret specs |
+| **Claude GHA** | Correctness, Tests, Style, Spec Adherence | Make architectural decisions |
 
-In autonomous mode, ORDER:
-1. Runs `code-explorer` to analyze codebase health
-2. Checks health thresholds (see Configuration)
-3. If unhealthy: generates improvement specs
-4. If healthy: optionally generates feature specs (if configured)
-5. Executes generated specs through standard pipeline
+### Self-Validation Invariant
 
-### Health Gates
+> **No actor may validate its own work product.**
 
-ORDER enforces health requirements before generating new feature specs:
+| Work Product | Created By | Validated By | Enforcement |
+|---|---|---|---|
+| Spec Contract | `/create-spec` | `/review-spec` (forked context) | `context: fork` |
+| Implementation | CHAOS `/work` | Claude GHA | Separate actor |
+| Merge readiness | CHAOS `/pr-monitor` | Claude GHA approval gate | External approval |
+| Spec intent | ORDER | Claude GHA (adherence check) | GHA rejects violations |
 
-```yaml
-# .CHAOS/order/config.yml
-autonomous:
-  enabled: true
+---
 
-  # Health thresholds (must pass before new features)
-  health_gates:
-    min_test_coverage: 70          # Percentage
-    max_critical_issues: 0         # Security/critical bugs
-    max_high_issues: 5             # High-severity tech debt
-
-  # What ORDER can generate
-  allow_feature_specs: false       # Only improvements until healthy
-  improvement_categories:
-    - tech_debt
-    - test_coverage
-    - security
-    - performance
-```
-
-When `allow_feature_specs: false`, ORDER focuses exclusively on codebase health. Once thresholds are met, setting `allow_feature_specs: true` allows ORDER to propose enhancements.
-
-### Example: Autonomous Improvement Run
+## Complete Workflow
 
 ```
-$ claude /loop --auto
+1. ORDER starts, reads docs/ROADMAP.md
+   STATE: INIT → PARSE_ROADMAP
 
-ORDER Autonomous Mode
-=====================
-Running code-explorer analysis...
+2. Identifies next uncompleted step (first [ ] checkbox)
+   /parse-roadmap extracts step details
 
-Codebase Health Report:
-  Test coverage: 45% (threshold: 70%) ❌
-  Critical issues: 0 ✓
-  High issues: 12 (threshold: 5) ❌
+3. /create-spec expands step into full Spec Contract
+   STATE: PARSE_ROADMAP → CREATE_SPEC
 
-Health gates NOT met. Generating improvement specs only.
+4. /review-spec validates spec completeness (forked context)
+   STATE: CREATE_SPEC → REVIEW_SPEC
 
-Generated specs:
-  1. 2025-02-03-add-auth-tests (test coverage)
-  2. 2025-02-03-fix-sql-injection (security)
-  3. 2025-02-03-refactor-duplicate-validation (tech debt)
+5. /plan-work decomposes spec into Beads Issue Contracts
+   STATE: REVIEW_SPEC → PLAN_WORK
 
-Processing queue...
-[ORDER proceeds to execute specs]
+6. Creates Beads issues, writes task queue
+   STATE: PLAN_WORK → EXECUTE_TASKS
+
+7. /loop or /parallel spawns CHAOS instances:
+   claude -p "/work <task-id>"
+
+8. CHAOS: implement → /self-check → push PR → /pr-monitor → merge → /learn
+
+9. ORDER polls Beads checking task completion
+   STATE: EXECUTE_TASKS → VERIFY_COMPLETION
+
+10. /verify-completion checks all completion gates
+
+11. /handoff creates structured YAML for next ORDER instance
+    STATE: VERIFY_COMPLETION → HANDOFF → EXIT
+
+12. New ORDER: /order-resume → INIT → next step
 ```
 
 ---
 
 ## Configuration
 
-### `.CHAOS/order/config.yml`
+### `.chaos/framework/order/config.yml`
 
 ```yaml
-# Safety limits - hard stops that cannot be exceeded
 safety:
-  max_iterations: 100          # Stop after N specs processed
-  max_time_hours: 24           # Stop after N hours
-  max_cost_dollars: 50.00      # Stop after estimated $N spent
-  max_consecutive_failures: 10 # Stop after N failures in a row
+  max_iterations: 100
+  max_time_hours: 24
+  max_consecutive_failures: 10
+  max_pr_age_hours: 24
+  max_concurrent_prs: 10
 
-# Behavior settings
+pr_workflow:
+  order_review: true
+  gha_wait_timeout_minutes: 30
+  merge_method: squash
+  delete_branch: true
+  post_merge_learn: true
+
+task_decomposition:
+  target_pr_size_loc: 400
+  max_pr_size_loc: 800
+
 behavior:
-  on_unresolvable: skip        # skip | halt
-  auto_commit: true            # Commit after each successful spec
-  branch_prefix: order/        # Git branch prefix for changes
-  dry_run: false               # Simulate without making changes
+  on_unresolvable: skip
+  auto_commit: true
+  branch_prefix: task/
+  dry_run: false
 
-# Notification (future)
-notify:
-  on_complete: false
-  on_failure: false
-  webhook_url: null
+roadmap:
+  path: docs/ROADMAP.md
+  spec_dir: specs/
+  auto_advance: true
+
+contracts:
+  spec_contract_required: true
+  completion_gates_required: true
+
+lifecycle:
+  enforce_state_machine: true
+  state_file: .chaos/framework/order/state.json
+
+handoff:
+  enabled: true
+  handoff_dir: .chaos/framework/order/handoffs/
 ```
-
-### `.CHAOS/order/queue.txt`
-
-Simple text file listing specs to process:
-
-```
-# Specs to process (one per line)
-# Lines starting with # are comments
-# Processed specs are removed from queue
-
-2025-02-03-user-authentication
-2025-02-03-api-rate-limiting
-2025-02-03-dashboard-redesign
-```
-
-### `.CHAOS/order/state.json`
-
-Runtime state maintained by `order-sentinel`:
-
-```json
-{
-  "status": "running",
-  "started_at": "2025-02-03T10:00:00Z",
-  "current_spec": "2025-02-03-user-auth",
-  "iteration": 7,
-  "completed": ["2025-02-03-setup", "2025-02-03-models"],
-  "failed": ["2025-02-03-api-refactor"],
-  "skipped": [],
-  "estimated_cost_dollars": 12.40,
-  "consecutive_failures": 0
-}
-```
-
----
-
-## Installation
-
-### Prerequisites
-
-- CHAOS installed in target project (`.CHAOS/version` exists)
-- Beads installed (`bd` command available)
-
-### Installation Flow
-
-```bash
-# 1. Clone ORDER repository
-git clone https://github.com/beartosis/order.git ~/order
-
-# 2. Navigate to your project (with CHAOS already installed)
-cd ~/my-project
-
-# 3. Install ORDER on top
-~/order/install.sh
-```
-
-**What the installer does**:
-1. Verifies CHAOS is installed
-2. Backs up existing `dispute-resolver.md`
-3. Installs ORDER agents to `.claude/agents/`
-4. Installs ORDER skills to `.claude/skills/`
-5. Merges ORDER hooks into `settings.local.json`
-6. Creates `.CHAOS/order/` directory with default config
-7. Runs verification
-
-### Uninstallation
-
-```bash
-~/CHAOS-ORDER/uninstall.sh
-```
-
-Restores original CHAOS agents and removes ORDER components.
 
 ---
 
 ## Safety Mechanisms
 
 ### 1. Iteration Limits
-
-Hard stop after processing N specs. Prevents infinite loops.
-
-```yaml
-safety:
-  max_iterations: 100
-```
+Stop after processing N tasks.
 
 ### 2. Time Limits
+Stop after N hours of execution.
 
-Hard stop after N hours. Prevents overnight runs from going too long.
+### 3. Failure Circuit Breaker
+Stop if too many consecutive failures.
 
-```yaml
-safety:
-  max_time_hours: 24
-```
-
-### 3. Cost/Token Limits
-
-Estimated cost tracking based on model usage. Hard stop when limit approached.
-
-```yaml
-safety:
-  max_cost_dollars: 50.00
-```
-
-**Cost estimation**:
-- Haiku: ~$0.001 per agent run
-- Sonnet: ~$0.01 per agent run
-- Opus: ~$0.10 per agent run
-
-### 4. Failure Circuit Breaker
-
-Stop if too many consecutive failures—something is probably wrong.
-
-```yaml
-safety:
-  max_consecutive_failures: 10
-```
-
-### 5. Kill File
-
-Touch this file to immediately halt ORDER:
-
+### 4. Kill File
 ```bash
-touch .CHAOS/order/STOP
+touch .chaos/framework/order/STOP
 ```
 
-The `order-sentinel` checks for this file before each iteration.
+### 5. PR Pipeline Health
+Sentinel monitors for stuck PRs, too many concurrent PRs, and GHA bottlenecks.
 
-### 6. Git Branch Safety
+### 6. Branch Safety
+All changes on `task/*` branches, never directly on main.
 
-All ORDER changes happen on feature branches, never directly on main:
+### 7. Dual Review Gate
+GHA must approve via CHAOS `/pr-monitor` before merge.
 
-```yaml
-behavior:
-  branch_prefix: order/
-```
-
-Creates branches like `order/2025-02-03-user-auth`.
-
-### 7. Dry Run Mode
-
-Test ORDER without making any actual changes:
-
+### 8. Dry Run Mode
 ```bash
-claude /loop --dry-run 2025-02-03-my-feature
+claude /loop --dry-run my-task
 ```
 
 ---
 
-## Repository Structure
+## v1 to v2 Migration
 
-```
-CHAOS-ORDER/
-├── README.md
-├── LICENSE
-├── install.sh                      # Main installer
-├── uninstall.sh                    # Clean removal
-├── lib/
-│   ├── order_check.sh              # Verify CHAOS installed
-│   ├── hooks_merge.sh              # Merge hooks into settings
-│   └── cost_estimator.sh           # Token/cost tracking
-├── templates/
-│   ├── .claude/
-│   │   ├── agents/
-│   │   │   ├── order-arbiter.md.tmpl
-│   │   │   ├── order-oracle.md.tmpl
-│   │   │   └── order-sentinel.md.tmpl
-│   │   ├── skills/
-│   │   │   ├── loop/
-│   │   │   │   └── SKILL.md.tmpl
-│   │   │   └── order-status/
-│   │   │       └── SKILL.md.tmpl
-│   │   └── scripts/
-│   │       ├── order-checkpoint.sh
-│   │       ├── order-log-decision.sh
-│   │       └── order-cost-track.sh
-│   └── .CHAOS/
-│       └── order/
-│           ├── config.yml.tmpl
-│           └── queue.txt.tmpl
-└── docs/
-    ├── architecture.md
-    ├── safety.md
-    └── troubleshooting.md
-```
-
----
-
-## Future Considerations
-
-### Potential Enhancements
-
-1. **Webhook notifications** — Alert on completion/failure
-2. **Web dashboard** — Monitor ORDER runs in browser
-3. **Spec prioritization** — Process high-priority specs first
-4. **Parallel execution** — Run multiple specs concurrently
-5. **Learning from failures** — Improve oracle decisions over time
-
-### Integration Points
-
-- **CI/CD**: Run ORDER as part of deployment pipeline
-- **Cron**: Schedule overnight ORDER runs
-- **GitHub Actions**: Trigger ORDER on new spec PRs
+| v1 | v2 |
+|----|-----|
+| Spec-based orchestration | Task-based decomposition |
+| `/orchestrate <spec>` | `/work <task-id>` (CHAOS) |
+| `dispute-resolver` replaced | No dispute-resolver in CHAOS v2 |
+| `code-explorer` for analysis | Oracle reads learnings + codebase |
+| Spec queue (one per line) | Task queue with wave metadata |
+| `order/*` branches | `task/*` branches |
+| No PR lifecycle | Full PR lifecycle (review, GHA, merge) |
+| No post-work learning | Post-merge `/learn` on every task |
 
 ---
 
 ## Summary
 
-ORDER transforms CHAOS from a human-supervised system into an autonomous one:
+ORDER v2 transforms CHAOS v2 from a supervised single-developer into a managed team:
 
 ```
-CHAOS alone:     Human → Spec → [Questions?] → Human → Execute → [Failure?] → Human
-CHAOS + ORDER:   Human → Spec → Queue → ORDER → Execute → Done
-ORDER auto:      ORDER → Analyze → Generate Spec → Execute → Repeat
+CHAOS v2 alone:  Human -> Task -> /work -> Draft PR -> Human reviews -> Merge
+CHAOS + ORDER:   Roadmap -> /parse-roadmap -> /create-spec -> /plan-work -> /loop -> /work -> /pr-monitor -> GHA -> Merge -> /learn
 ```
 
-ORDER operates in two modes:
-- **Queue mode**: Human writes specs, ORDER executes them
-- **Autonomous mode**: ORDER analyzes codebase, generates specs, executes them
-
-The "Health Before Features" philosophy ensures ORDER prioritizes codebase quality over new functionality—earning the right to add features by first proving the foundation is solid.
-
-**Remember**: With great automation comes great responsibility. Always review ORDER's decisions in the Beads audit trail, and start with conservative safety limits.
+The Engineering Lead manages the full lifecycle while respecting safety limits and maintaining a complete audit trail in Beads.

@@ -1,0 +1,157 @@
+---
+name: order-resume
+description: |
+  Resume ORDER execution from a structured handoff document.
+  Reads previous context, validates schema and state, continues roadmap.
+  Handles process lifecycle (old instance cleanup).
+argument-hint: "<handoff-file-path>"
+disable-model-invocation: true
+allowed-tools: Read, Grep, Bash, Write
+---
+
+# Order Resume: Resume from Handoff
+
+Resume ORDER execution from a structured handoff document. Validates schema, verifies previous step completion, and continues the roadmap.
+
+## Arguments
+
+Handoff file path: `$ARGUMENTS`
+
+## Workflow
+
+### Step 1: Read Handoff
+
+```bash
+HANDOFF_PATH="$ARGUMENTS"
+if [ -z "$HANDOFF_PATH" ] || [ ! -f "$HANDOFF_PATH" ]; then
+  echo "Usage: /order-resume <handoff-file-path>"
+  echo "Example: /order-resume .chaos/framework/order/handoffs/step-3_HANDOFF.yml"
+  exit 1
+fi
+
+cat "$HANDOFF_PATH"
+```
+
+### Step 2: Validate Handoff Schema
+
+Verify all required fields are present and well-formed:
+
+```bash
+# Required top-level keys
+for key in step_completed execution_summary key_decisions tradeoffs \
+           known_risks learnings standards_updated followups \
+           next_step roadmap_progress; do
+  if ! grep -q "^${key}:" "$HANDOFF_PATH"; then
+    echo "FATAL: Handoff missing required field: $key"
+    echo "Handoff file is malformed. Cannot resume."
+    exit 1
+  fi
+done
+
+# Verify step_completed.status is COMPLETE
+STATUS=$(cat "$HANDOFF_PATH" | python3 -c "import sys,yaml; print(yaml.safe_load(sys.stdin)['step_completed']['status'])" 2>/dev/null)
+if [[ "$STATUS" != "COMPLETE" ]]; then
+  echo "FATAL: Previous step status is not COMPLETE: $STATUS"
+  exit 1
+fi
+```
+
+### Step 3: Verify Previous Step Complete
+
+```bash
+# Extract previous step number
+PREV_STEP=$(cat "$HANDOFF_PATH" | grep -A5 "step_completed:" | grep "number:" | head -1 | awk '{print $2}')
+
+# Check roadmap checkbox is [X]
+if ! grep -q "^${PREV_STEP}\. \[X\]" docs/ROADMAP.md; then
+  echo "WARNING: Step $PREV_STEP not marked [X] in roadmap"
+fi
+
+# Verify PRs are merged
+gh pr list --search "step-${PREV_STEP}" --state open --json number -q '.[].number' | while read PR; do
+  echo "WARNING: PR #$PR still open for step $PREV_STEP"
+done
+
+# Check Beads issues are closed
+bd list --tag "step-${PREV_STEP}" --status=open 2>/dev/null
+```
+
+### Step 4: Read Accumulated Learnings
+
+```bash
+cat .chaos/learnings.md
+```
+
+Integrate learnings from the handoff document and accumulated learnings file.
+
+### Step 5: Read Current State
+
+```bash
+cat .chaos/framework/order/state.json
+```
+
+### Step 6: Handle Process Lifecycle
+
+```bash
+# Check for running ORDER instances
+# Clean up if needed (implementation is runtime-specific)
+# This is a best-effort cleanup — gracefully handle if old instance is already dead
+```
+
+### Step 7: Update State
+
+```bash
+# Reset state to INIT for new cycle
+NEXT_STEP=$(cat "$HANDOFF_PATH" | grep -A5 "next_step:" | grep "number:" | head -1 | awk '{print $2}')
+
+cat .chaos/framework/order/state.json | jq \
+  --arg state "INIT" \
+  --arg step "$NEXT_STEP" \
+  --arg time "$(date -Iseconds)" \
+  --arg handoff "$HANDOFF_PATH" \
+  '.current_state = $state | .step_number = ($step | tonumber) | .last_transition = $time | .resumed_from = $handoff | .transition_history += [{"from": .current_state, "to": $state, "at": $time}]' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+### Step 8: Display Handoff Summary
+
+```markdown
+## ORDER Resumed
+
+**Previous Step**: {N} - {title} (COMPLETE)
+**PRs Merged**: {count}
+**Key Decisions**: {count}
+**Learnings**: {count}
+**Followups**: {list}
+
+### Next Step
+  {N+1}. {title}
+  Phase: {phase}
+  Complexity: {rating}
+  Dependencies: {list}
+```
+
+### Step 9: Auto-Invoke Parse Roadmap
+
+```bash
+# Automatically identify next step
+/parse-roadmap
+```
+
+### Step 10: Output
+
+```markdown
+Ready to continue. Next step: {step-title}.
+Run `/create-spec {step-number}` to create the Spec Contract.
+```
+
+---
+
+## CRITICAL Rules
+
+1. **Must validate handoff schema** — Reject malformed handoffs
+2. **Verify state consistency** — Previous step must be COMPLETE
+3. **Gracefully handle dead instances** — Don't fail if old instance gone
+4. **Read full handoff context** — Understand before proceeding
+5. **Trust previous ORDER's decisions** — Don't second-guess
+6. **Auto-invoke /parse-roadmap** — Continue the cycle automatically

@@ -1,0 +1,210 @@
+---
+name: handoff
+description: |
+  Create structured handoff document for ORDER-to-ORDER transition.
+  Captures decisions, outcomes, and next intent for next ORDER instance.
+  Uses strict YAML schema — no narrative prose.
+argument-hint: "<step-number>"
+disable-model-invocation: true
+allowed-tools: Read, Grep, Glob, Bash, Write
+---
+
+# Handoff: ORDER-to-ORDER Context Transfer
+
+Create a structured handoff document for transitioning to a new ORDER instance after completing a roadmap step. Uses strict YAML schema — no narrative prose.
+
+## Arguments
+
+Step number: `$ARGUMENTS`
+
+## Workflow
+
+### Step 1: Parse Step Number
+
+```bash
+STEP_NUM="$ARGUMENTS"
+if [ -z "$STEP_NUM" ]; then
+  echo "Usage: /handoff <step-number>"
+  exit 1
+fi
+```
+
+### Step 2: Verify Completion Gates
+
+```bash
+# Verify all completion gates pass
+# /verify-completion must have returned COMPLETE
+CURRENT_STATE=$(cat .chaos/framework/order/state.json | jq -r '.current_state')
+if [[ "$CURRENT_STATE" != "VERIFY_COMPLETION" ]]; then
+  echo "ERROR: Cannot create handoff in state $CURRENT_STATE"
+  echo "Run /verify-completion $STEP_NUM first"
+  exit 1
+fi
+```
+
+### Step 3: Read Roadmap Context
+
+```bash
+# Get current step details
+grep "^${STEP_NUM}\. " docs/ROADMAP.md
+
+# Get next step
+NEXT_NUM=$((STEP_NUM + 1))
+grep "^${NEXT_NUM}\. " docs/ROADMAP.md
+
+# Get phase context
+grep "## Phase" docs/ROADMAP.md
+```
+
+### Step 4: Gather Context
+
+```bash
+# PRs merged for this step
+gh pr list --search "step-${STEP_NUM}" --state merged \
+  --json number,title -q '.[].number'
+
+# Oracle/arbiter decisions
+grep "ORDER-ORACLE\|ORDER-ARBITER" .chaos/framework/runs/*/output.log 2>/dev/null
+
+# Learnings from CHAOS /learn outputs
+cat .chaos/learnings.md | tail -50
+
+# Outstanding issues or tech debt
+bd list --tag "step-${STEP_NUM}" --status=open 2>/dev/null
+```
+
+### Step 5: Write Handoff Document
+
+```bash
+mkdir -p .chaos/framework/order/handoffs
+
+cat > ".chaos/framework/order/handoffs/step-${STEP_NUM}_HANDOFF.yml" << 'HANDOFF_EOF'
+# ORDER Handoff: Step {N} -> Step {N+1}
+
+step_completed:
+  number: {N}
+  title: "{title}"
+  phase: "{phase name}"
+  phase_number: {M}
+  status: COMPLETE
+
+execution_summary:
+  prs_merged:
+    count: {count}
+    numbers: [{list}]
+  tasks_completed: {count}
+
+key_decisions:
+  - context: "{what prompted the decision}"
+    decision: "{what was decided}"
+    actor: "{oracle | arbiter | order}"
+    rationale: "{why}"
+
+tradeoffs:
+  - "{tradeoff description}"
+
+known_risks:
+  - "{risk description}"
+
+learnings:
+  - source: "{CHAOS /learn output or observation}"
+    insight: "{what was learned}"
+
+standards_updated:
+  - "{file path and what changed}"
+
+followups:
+  - "{tech debt or deferred work}"
+
+next_step:
+  number: {N+1}
+  title: "{title}"
+  phase: "{phase name}"
+  dependencies: ["{prerequisite step numbers}"]
+  estimated_complexity: "{XS/S/M/L}"
+
+roadmap_progress:
+  completed: {N}
+  total: 342
+  current_phase: "{M}/{total phases}"
+HANDOFF_EOF
+```
+
+### Step 6: Update State and Write Result
+
+```bash
+# Update state.json and write last_result for orchestrator
+HANDOFF_PATH=".chaos/framework/order/handoffs/step-${STEP_NUM}_HANDOFF.yml"
+cat .chaos/framework/order/state.json | jq \
+  --arg state "HANDOFF" \
+  --arg time "$(date -Iseconds)" \
+  --arg skill "handoff" \
+  --arg verdict "HANDOFF_WRITTEN" \
+  --arg handoff_path "$HANDOFF_PATH" \
+  '.current_state = $state | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}] | .last_result = {skill: $skill, verdict: $verdict, handoff_path: $handoff_path}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+### Step 6b: Commit Step Completion Artifacts
+
+```bash
+# Commit the spec, handoff document, state, and roadmap progress
+# Use glob to match the spec directory regardless of slug
+git add \
+    specs/step-${STEP_NUM}-*/SPEC.md \
+    ".chaos/framework/order/handoffs/step-${STEP_NUM}_HANDOFF.yml" \
+    .chaos/framework/order/state.json \
+    docs/ROADMAP.md
+
+# Include learnings if modified in working tree
+git diff --quiet .chaos/learnings.md 2>/dev/null || git add .chaos/learnings.md
+
+STEP_TITLE=$(grep "^${STEP_NUM}\. " docs/ROADMAP.md | sed 's/^[0-9]*\. \[.\] //')
+git commit -m "chore(order): complete step ${STEP_NUM} handoff — ${STEP_TITLE}"
+```
+
+### Step 7: Output
+
+```markdown
+## Handoff Complete
+
+**File**: .chaos/framework/order/handoffs/step-{N}_HANDOFF.yml
+**Step Completed**: {N} - {title}
+**Next Step**: {N+1} - {next title}
+
+### Next Action
+Start new ORDER instance:
+  claude /order-resume .chaos/framework/order/handoffs/step-{N}_HANDOFF.yml
+```
+
+---
+
+## Required Handoff Schema
+
+All fields are required. `/order-resume` validates schema before proceeding.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| step_completed | object | Step number, title, phase, status |
+| execution_summary | object | PRs merged count/numbers, tasks completed |
+| key_decisions | list | Context, decision, actor, rationale |
+| tradeoffs | list | Tradeoff descriptions |
+| known_risks | list | Risk descriptions |
+| learnings | list | Source and insight pairs |
+| standards_updated | list | File paths and changes |
+| followups | list | Tech debt or deferred work |
+| next_step | object | Number, title, phase, dependencies, complexity |
+| roadmap_progress | object | Completed count, total, current phase |
+
+> **No narrative prose**. No PIDs. No shell commands. Intent only.
+
+---
+
+## CRITICAL Rules
+
+1. **All completion gates must pass first** — Cannot handoff incomplete step
+2. **Strict YAML schema** — No narrative paragraphs
+3. **Preserve all decisions** — Oracle/arbiter decisions for continuity
+4. **Document deviations** — Any spec violations or unexpected issues
+5. **No PIDs or process management** — Intent only, not runtime state
+6. **Schema validated by /order-resume** — Malformed handoffs are rejected

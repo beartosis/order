@@ -1,0 +1,225 @@
+---
+name: create-spec
+description: |
+  Create a detailed Spec Contract from a roadmap step.
+  Explores codebase, analyzes requirements, produces structured SPEC.md
+  conforming to the mandatory Spec Contract format.
+  Invokes /order-oracle for ambiguous decisions.
+argument-hint: "<step-number>"
+disable-model-invocation: true
+allowed-tools: Read, Grep, Glob, Bash, Task, Write, TodoWrite
+---
+
+# Create Spec: Roadmap Step to Spec Contract
+
+Expand a one-line roadmap step into a full Spec Contract by exploring the codebase, analyzing requirements, and producing a structured SPEC.md.
+
+## Arguments
+
+Step number: `$ARGUMENTS` (or use `/parse-roadmap` to get next)
+
+## Workflow
+
+### Step 1: Parse Step Number
+
+```bash
+STEP_NUM="$ARGUMENTS"
+if [ -z "$STEP_NUM" ]; then
+  echo "Usage: /create-spec <step-number>"
+  echo "Or run /parse-roadmap first to identify next step"
+  exit 1
+fi
+```
+
+### Step 2: Read Roadmap Step
+
+```bash
+# Extract the specific step line from roadmap
+grep "^${STEP_NUM}\. " docs/ROADMAP.md
+```
+
+Parse: title, description, complexity rating.
+
+### Step 3: Read Project Context
+
+```bash
+# Read project vision and design
+cat docs/MISSION.md 2>/dev/null
+cat docs/GAME_DESIGN.md 2>/dev/null
+cat docs/architecture.md 2>/dev/null
+
+# Read standards
+ls standards/ && cat standards/*.yml 2>/dev/null
+
+# Read accumulated learnings
+cat .chaos/learnings.md 2>/dev/null
+```
+
+### Step 4: Explore Codebase
+
+Search for related modules, existing patterns, and code that this step will interact with:
+
+```bash
+# Find related files based on step keywords
+grep -r "[relevant patterns from step description]" --files-with-matches
+
+# Check existing module structure
+ls -la src/ internal/ pkg/ 2>/dev/null
+
+# Look at test patterns
+ls tests/ test/ *_test.go 2>/dev/null
+```
+
+### Step 5: Consult Oracle (if needed)
+
+If step complexity is M/L or scope is ambiguous, invoke `/order-oracle`:
+
+```
+/order-oracle "How should we approach [step description] given [codebase context]?"
+```
+
+### Step 6: Check Dependencies
+
+Verify prerequisite steps are complete:
+
+```bash
+# Check if dependent steps are marked [X] in roadmap
+# Steps with lower numbers that this step builds on
+```
+
+If dependencies are unmet, report and exit.
+
+### Step 7: Draft Spec Contract
+
+Write the full Spec Contract following the required format (see below).
+
+### Step 8: Write Spec File
+
+```bash
+# Create spec directory
+SLUG=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')
+SPEC_DIR="specs/step-${STEP_NUM}-${SLUG}"
+mkdir -p "$SPEC_DIR"
+
+# Write spec
+cat > "$SPEC_DIR/SPEC.md" << 'SPEC_EOF'
+[generated spec content]
+SPEC_EOF
+```
+
+### Step 9: Update Roadmap Checkbox
+
+```bash
+# Mark step as spec-created: [ ] -> [S]
+sed -i "s/^${STEP_NUM}\. \[ \]/\${STEP_NUM}. [S]/" docs/ROADMAP.md
+```
+
+### Step 10: Update State and Write Result
+
+```bash
+# Update state.json to CREATE_SPEC and write last_result for orchestrator
+cat .chaos/framework/order/state.json | jq \
+  --arg state "CREATE_SPEC" \
+  --arg spec "step-${STEP_NUM}-${SLUG}" \
+  --arg time "$(date -Iseconds)" \
+  --arg skill "create-spec" \
+  --arg verdict "SPEC_CREATED" \
+  --arg spec_path "specs/step-${STEP_NUM}-${SLUG}/SPEC.md" \
+  '.current_state = $state | .spec_id = $spec | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}] | .last_result = {skill: $skill, verdict: $verdict, spec_path: $spec_path}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+Output:
+```markdown
+## Spec Contract Created
+
+**Path**: specs/step-{N}-{slug}/SPEC.md
+**Step**: {N} - {title}
+**Complexity**: {rating}
+
+### Next Action
+Run `/review-spec specs/step-{N}-{slug}/SPEC.md` to validate the spec.
+```
+
+---
+
+## Required Spec Contract Format
+
+Every spec produced by `/create-spec` **must** conform to this schema. `/review-spec` **must reject** specs missing required sections.
+
+```markdown
+# Spec: <title>
+
+## Step Reference
+- Step: {number}
+- Phase: {phase name}
+- Complexity: {XS/S/M/L}
+- Dependencies: {prerequisite step numbers, or "none"}
+
+## Purpose
+Why this exists. One paragraph max.
+
+## In Scope
+Explicitly included behaviors and deliverables. Bullet list.
+
+## Out of Scope
+Explicitly excluded behaviors — non-goals, adjacent features not being built.
+CHAOS and Claude GHA use this to reject scope creep.
+
+## Constraints
+Constraints that can break correctness if violated.
+- Architectural constraints (patterns, module boundaries)
+- Performance constraints (specific targets, not "fast")
+- Security constraints (auth, input validation)
+
+## Required Interfaces
+Only externally visible or cross-module interfaces.
+- Public APIs (method signatures, endpoints)
+- DB schema changes (tables, columns, migrations)
+- Events or messages (topics, payloads)
+
+## Technical Approach
+Based on codebase exploration and project standards.
+Grounded in existing patterns from standards/ and learnings.
+This is the primary channel through which ORDER communicates
+architectural intent to CHAOS — it must be concrete.
+
+## Risks
+Specific risks that affect task decomposition or execution order.
+Each risk must name a concrete consequence and a mitigation.
+Not prose — actionable items only.
+
+## Acceptance Criteria
+- [ ] Testable condition 1
+- [ ] Testable condition 2
+- [ ] Error cases handled
+- [ ] Tests added for each functional condition
+
+## Decomposition Notes (ORDER-only)
+Guidance for /plan-work on how to split this spec into tasks.
+Which acceptance criteria group naturally. Suggested task boundaries.
+```
+
+### Sections Intentionally Excluded (and Why)
+
+| Section | Reason Excluded |
+|---------|----------------|
+| Estimated Scope (LOC) | LLMs hallucinate numbers; false precision is worse than no precision |
+| Files Affected | Predictions are often wrong; CHAOS discovers actual files during implementation |
+
+These may be useful as *advisory* output from `/plan-work` (which has more context) but do not belong in the Spec Contract.
+
+---
+
+## CRITICAL Rules
+
+1. **Always explore codebase first** — Ground specs in reality, not assumptions
+2. **Follow Spec Contract format exactly** — All 10 sections required
+3. **Testable acceptance criteria only** — No "works correctly" or "handles edge cases"
+4. **Technical Approach must be concrete** — Reference specific existing patterns
+5. **Constraints must be specific** — Numbers, module names, not adjectives
+6. **Check dependencies first** — Never create spec for step with unmet dependencies
+7. **Consult oracle for M/L complexity** — Don't guess on ambiguous scope
+8. **Ground in standards and learnings** — Use accumulated project knowledge
+9. **Update roadmap checkbox** — Mark `[S]` after spec creation
+10. **Suggest /review-spec next** — Spec must be validated before /plan-work

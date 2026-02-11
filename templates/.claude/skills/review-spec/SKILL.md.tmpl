@@ -1,0 +1,225 @@
+---
+name: review-spec
+description: |
+  Review a Spec Contract for completeness, feasibility, and quality.
+  Validates against the required Spec Contract schema, codebase reality,
+  and project standards. Runs in forked context to enforce the
+  self-validation invariant.
+argument-hint: "<spec-path>"
+context: fork
+disable-model-invocation: true
+allowed-tools: Read, Grep, Glob, Bash, Task
+---
+
+# Review Spec: Validate Spec Contract Quality
+
+Review a Spec Contract for completeness, feasibility, and quality. This skill runs in **forked context** to enforce the self-validation invariant: the reviewer never shares state with the creator.
+
+> **Self-Validation Invariant**: No actor may validate its own work product. `/create-spec` and `/review-spec` run in independent contexts.
+
+## Arguments
+
+Spec path: `$ARGUMENTS`
+
+## Workflow
+
+### Step 1: Read Spec
+
+```bash
+SPEC_PATH="$ARGUMENTS"
+if [ -z "$SPEC_PATH" ] || [ ! -f "$SPEC_PATH" ]; then
+  echo "Usage: /review-spec <spec-path>"
+  echo "Example: /review-spec specs/step-3-redis-integration/SPEC.md"
+  exit 1
+fi
+
+cat "$SPEC_PATH"
+```
+
+### Step 2: Schema Validation
+
+Verify all required Spec Contract sections are present and non-empty:
+
+| Section | Required | Check |
+|---------|----------|-------|
+| Step Reference | Yes | Contains step number, phase, complexity, dependencies |
+| Purpose | Yes | Non-empty, one paragraph |
+| In Scope | Yes | Non-empty bullet list |
+| Out of Scope | Yes | Non-empty bullet list |
+| Constraints | Yes | Specific constraints (numbers, names — not adjectives) |
+| Required Interfaces | Yes | Concrete signatures, not descriptions |
+| Technical Approach | Yes | References existing codebase patterns |
+| Risks | Yes | Concrete consequences and mitigations |
+| Acceptance Criteria | Yes | Testable checklist items |
+| Decomposition Notes | Yes | Non-empty guidance for /plan-work |
+
+```bash
+# Check each required section
+MISSING=()
+for section in "Step Reference" "Purpose" "In Scope" "Out of Scope" "Constraints" \
+               "Required Interfaces" "Technical Approach" "Risks" "Acceptance Criteria" "Decomposition Notes"; do
+  if ! grep -q "## $section" "$SPEC_PATH"; then
+    MISSING+=("$section")
+  fi
+done
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+  echo "SCHEMA FAIL: Missing sections: ${MISSING[*]}"
+  echo "Verdict: NEEDS_REVISION"
+  exit 1
+fi
+```
+
+### Step 3: Content Validation
+
+Check quality of each section:
+
+**Acceptance Criteria**:
+- Must be testable (FAIL if vague: "works correctly", "handles edge cases", "is performant")
+- Must use checkbox format: `- [ ] Testable condition`
+- Each criterion must describe a specific, observable behavior
+
+**In Scope / Out of Scope**:
+- Must not contradict each other
+- Out of Scope must explicitly name non-goals
+
+**Required Interfaces**:
+- Must have concrete signatures (method names, parameter types, return types)
+- Not descriptions like "an API endpoint that does X"
+
+**Constraints**:
+- Must be specific: numbers, module names, concrete limits
+- FAIL if contains adjectives without specifics ("fast", "secure", "scalable")
+
+**Technical Approach**:
+- Must reference existing codebase patterns (not aspirational architecture)
+- Must be grounded in standards/ and learnings
+
+**Risks**:
+- Each risk must name a concrete consequence AND a mitigation
+- Not narrative prose — actionable items only
+
+### Step 4: Codebase Verification
+
+```bash
+# Verify file references exist in codebase
+# Check that referenced modules, packages, patterns actually exist
+
+# Verify referenced interfaces are compatible
+# Check that technical approach aligns with actual codebase structure
+```
+
+### Step 5: Standards Check
+
+```bash
+# Read project standards
+cat standards/standards.yml 2>/dev/null
+
+# Verify technical approach aligns with architecture
+cat docs/architecture.md 2>/dev/null
+```
+
+### Step 6: Learnings Check
+
+```bash
+# Check for conflicting past decisions
+cat .chaos/learnings.md 2>/dev/null
+```
+
+Look for past decisions that conflict with or inform this spec.
+
+### Step 7: Feasibility Assessment
+
+Evaluate:
+- **Risk areas**: Are identified risks realistic and mitigatable?
+- **Dependencies**: Are prerequisite steps actually complete?
+- **Scope**: Is the spec trying to do too much for one step?
+
+### Step 8: Generate Review Report
+
+```markdown
+## Spec Review Report
+
+**Spec**: {spec-path}
+**Step**: {step-number} - {title}
+
+### Schema Validation
+| Section | Status |
+|---------|--------|
+| Step Reference | PASS/FAIL |
+| Purpose | PASS/FAIL |
+| In Scope | PASS/FAIL |
+| Out of Scope | PASS/FAIL |
+| Constraints | PASS/FAIL |
+| Required Interfaces | PASS/FAIL |
+| Technical Approach | PASS/FAIL |
+| Risks | PASS/FAIL |
+| Acceptance Criteria | PASS/FAIL |
+| Decomposition Notes | PASS/FAIL |
+
+### Content Quality
+| Check | Status |
+|-------|--------|
+| Testable criteria | PASS/FAIL |
+| No contradictions | PASS/FAIL |
+| Concrete interfaces | PASS/FAIL |
+| Specific constraints | PASS/FAIL |
+| Grounded approach | PASS/FAIL |
+| Actionable risks | PASS/FAIL |
+
+### Feasibility
+Risk Level: HIGH/MEDIUM/LOW
+
+### Issues
+1. [severity] Description of issue
+2. [severity] Description of issue
+
+### Recommendations
+- Specific improvement 1
+- Specific improvement 2
+
+### Verdict: READY / NEEDS_REVISION
+```
+
+### Step 9: Update State and Write Result
+
+If verdict is READY:
+```bash
+# Update state.json and write last_result for orchestrator
+cat .chaos/framework/order/state.json | jq \
+  --arg state "REVIEW_SPEC" \
+  --arg time "$(date -Iseconds)" \
+  --arg skill "review-spec" \
+  --arg verdict "READY" \
+  '.current_state = $state | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}] | .last_result = {skill: $skill, verdict: $verdict}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+
+echo "Spec approved. Run: /plan-work $SPEC_PATH"
+```
+
+If verdict is NEEDS_REVISION:
+```bash
+# Write last_result with revision issues for orchestrator
+# Collect the issues list from the review report above
+cat .chaos/framework/order/state.json | jq \
+  --arg skill "review-spec" \
+  --arg verdict "NEEDS_REVISION" \
+  --argjson issues '["issue1", "issue2"]' \
+  '.last_result = {skill: $skill, verdict: $verdict, issues: $issues}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+
+echo "Spec needs revision. Address issues above and re-run /create-spec."
+# State remains in CREATE_SPEC
+```
+
+---
+
+## CRITICAL Rules
+
+1. **Flag ambiguous acceptance criteria** — FAIL, not warn
+2. **Check for scope creep** — Spec trying to do too much
+3. **Don't modify spec** — Read-only analysis
+4. **Reject missing sections** — All 10 required Spec Contract sections mandatory
+5. **Must run in forked context** — Self-validation invariant
+6. **Verify against codebase** — Not just schema, check reality
+7. **Check standards and learnings** — Alignment with project knowledge

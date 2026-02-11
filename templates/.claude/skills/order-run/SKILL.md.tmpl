@@ -1,0 +1,66 @@
+---
+name: order-run
+description: |
+  Autonomous lifecycle orchestrator. Launches the bash state machine
+  dispatcher which runs each skill in a fresh Claude process:
+  /parse-roadmap -> /create-spec -> /review-spec -> /plan-work
+  -> /work (per task) -> MERGE_PRS -> /verify-completion -> /handoff -> next step
+argument-hint: "[--max-steps N] [--start-step N]"
+disable-model-invocation: true
+allowed-tools: Bash
+---
+
+# Order Run: Autonomous Lifecycle Orchestrator
+
+Launches the bash-based state machine dispatcher. Each skill gets its own
+fresh Claude process and context window. The bash script reads state.json
+between dispatches, decides the next skill, and spawns it via `claude -p`.
+
+## Workflow
+
+Run the orchestrator:
+
+```bash
+bash .claude/scripts/order-run-loop.sh $ARGUMENTS
+```
+
+## What It Does
+
+The bash wrapper is the real orchestrator. It reads `state.json` with `jq`,
+dispatches the right skill via `claude -p --dangerously-skip-permissions`,
+reads `state.json` for the result, and repeats:
+
+```
+INIT -> /parse-roadmap -> /create-spec -> /review-spec -> /plan-work
+     -> /work (per task) -> MERGE_PRS -> /verify-completion -> /handoff -> next step
+```
+
+Each skill invocation is a **separate Claude process** with its own context
+window. The handoff between skills is via `state.json` and `last_result`.
+
+For task execution, the wrapper reads `queue.txt` and spawns
+`claude -p "/work <task-id>"` for each task (sequential or parallel by wave).
+
+## Arguments
+
+- No args: Resume from current state, run until roadmap complete
+- `--max-steps N`: Process at most N roadmap steps
+- `--start-step N`: Start from a specific step number
+
+## Environment Variables
+
+- `WORK_MODEL`: Model for /work instances (default: sonnet)
+
+## State Machine
+
+| State | Dispatches | Reads |
+|-------|-----------|-------|
+| INIT | `/parse-roadmap` | `last_result.verdict` (STEP_FOUND or ROADMAP_COMPLETE) |
+| PARSE_ROADMAP | `/create-spec {step}` | `step_number` |
+| CREATE_SPEC | `/review-spec` or re-run `/create-spec` | `last_result.verdict` (READY or NEEDS_REVISION) |
+| REVIEW_SPEC | `/plan-work {spec}` | `spec_id` |
+| PLAN_WORK | `claude -p "/work {task}"` per task | `queue.txt`, config `execution_mode` |
+| EXECUTE_TASKS | Arbiter (if failed), then transition to MERGE_PRS | `last_result.verdict` (TASKS_COMPLETE or TASKS_FAILED) |
+| MERGE_PRS | `gh pr ready/view/merge`, `/review-feedback` | `.prs` object, config: `gha_wait_timeout_minutes`, `merge_method`, `delete_branch` |
+| VERIFY_COMPLETION | `/handoff {step}` | `step_number` |
+| HANDOFF | Reset to INIT | Next step begins |
