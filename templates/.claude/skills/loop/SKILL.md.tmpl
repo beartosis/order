@@ -10,7 +10,7 @@ allowed-tools: Read, Grep, Glob, Bash, Task, Write, TodoWrite
 
 # Loop: Autonomous Task Execution
 
-Execute tasks sequentially without human intervention. For each task: spawn CHAOS `/work`, monitor PR via CHAOS `/pr-monitor`, and learn. CHAOS handles the full PR feedback loop autonomously.
+Execute tasks sequentially without human intervention. For each task: spawn CHAOS `/work` and monitor PR via CHAOS `/pr-monitor`. CHAOS handles the full PR feedback loop autonomously. Learning is captured inline by `/work` Step 8.
 
 ## Modes
 
@@ -125,10 +125,7 @@ For each task in queue (respecting wave order):
 |     > Polls GHA every 2 min, addresses feedback           |
 |     > Merges when all gates pass                          |
 |                                                            |
-|  8. POST-MERGE LEARN                                       |
-|     > Spawn: claude -p "/learn" (if configured)           |
-|                                                            |
-| 8.5 PULL MAIN                                              |
+|  5. PULL MAIN                                              |
 |     > git pull origin main (keep local up to date)        |
 |                                                            |
 |  9. RECORD RESULT                                          |
@@ -231,12 +228,7 @@ PR_NUM=$(cat "$RUN_DIR/pr_number")
 #    - Polls GHA every 2 minutes
 #    - Addresses review feedback
 #    - Merges when all gates pass (GHA approved, checklist complete, tests green)
-
-# 3. Post-merge learning
-claude -p "/learn" \
-  --dangerously-skip-permissions \
-  --model sonnet \
-  > "$RUN_DIR/learn.log" 2>&1
+#    - /work Step 8 captures learnings inline before session ends
 ```
 
 > **Note**: ORDER no longer reviews PRs directly. CHAOS `/pr-monitor` handles the full PR feedback loop autonomously. GHA must approve via CHAOS `/pr-monitor` before merge.
@@ -285,7 +277,6 @@ ORDER Loop: Processing my-task (3 of 10)
 +- /work complete: Draft PR #42 created
 +- /pr-monitor #42: GHA APPROVED, all gates pass
 +- Merged: PR #42
-+- /learn: Captured 2 observations
 +- Result: COMPLETED
 
 ORDER Loop: Processing api-refactor (4 of 10)
@@ -344,7 +335,7 @@ pr_workflow:
   gha_wait_timeout_minutes: 30
   merge_method: squash
   delete_branch: true
-  post_merge_learn: true
+  # Learning is now baked into /work Step 8 (inline, not a separate spawn)
 
 behavior:
   on_unresolvable: skip    # skip | halt
@@ -364,4 +355,4 @@ behavior:
 5. **Update state atomically** - Keep state.json consistent
 6. **Branch per task** - Use `task/[task-name]` branches
 7. **GHA must approve** - via CHAOS /pr-monitor before merge
-8. **Post-merge /learn** - Capture observations after every merge
+8. **Learnings captured in /work** - Step 8 of /work handles learning inline
