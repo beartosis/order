@@ -79,6 +79,49 @@ preflight() {
     fi
 }
 
+# Enrich state.json with CI failure context for the arbiter
+# Usage: enrich_ci_context <pr_number> <fix_attempt> <max_fix_attempts>
+enrich_ci_context() {
+    local pr_num="$1" fix_attempt="$2" max_attempts="$3"
+    local pr_branch
+
+    pr_branch=$(gh pr view "$pr_num" --json headRefName -q '.headRefName' 2>/dev/null || echo "")
+
+    # Fetch failed check details from statusCheckRollup
+    local failed_checks
+    failed_checks=$(gh pr view "$pr_num" --json statusCheckRollup \
+        -q '[.statusCheckRollup // [] | .[] | select(.status == "COMPLETED" and .conclusion == "FAILURE")] | map({name: .name, detail: .detailsUrl})' \
+        2>/dev/null || echo "[]")
+
+    # Extract job_id and run_id from detailsUrl (format: .../runs/{run_id}/job/{job_id})
+    local enriched_checks
+    enriched_checks=$(echo "$failed_checks" | jq '[.[] | {
+        name: .name,
+        job_id: (.detail | capture("job/(?<id>[0-9]+)") | .id // empty),
+        run_id: (.detail | capture("runs/(?<id>[0-9]+)") | .id // empty)
+    }]' 2>/dev/null || echo "[]")
+
+    # Warn if job ID extraction failed (arbiter will still run but may not fetch logs)
+    if [ "$enriched_checks" = "[]" ] || [ -z "$enriched_checks" ]; then
+        echo "    x Warning: Failed to extract job IDs from failed checks for PR $pr_num"
+    fi
+
+    jq --arg pr "$pr_num" \
+       --arg branch "$pr_branch" \
+       --argjson attempt "$fix_attempt" \
+       --argjson max "$max_attempts" \
+       --argjson checks "$enriched_checks" \
+       '.arbiter_context = {
+            pr_number: $pr,
+            pr_branch: $branch,
+            failure_type: "checks_failed",
+            failed_checks: $checks,
+            fix_attempt: $attempt,
+            max_fix_attempts: $max
+        }' \
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+}
+
 # ── Initialization ────────────────────────────────────────────────
 
 if [ ! -f "$STATE_FILE" ]; then
@@ -132,13 +175,12 @@ while true; do
         PARSE_ROADMAP)
             STEP=$(state '.step_number')
 
-            # If parse-roadmap reported SPEC_EXISTS for a completed step,
-            # advance step_number and re-parse instead of re-creating the spec
+            # If parse-roadmap reported SPEC_EXISTS, skip to REVIEW_SPEC
             if [ "$VERDICT" = "SPEC_EXISTS" ]; then
-                echo "  Step $STEP already has a spec. Advancing to next step."
-                NEXT_STEP=$((STEP + 1))
-                jq --argjson step "$NEXT_STEP" --arg time "$(date -Iseconds)" \
-                   '.current_state = "INIT" | .step_number = $step | .last_transition = $time | del(.last_result)' \
+                echo "  Step $STEP already has a spec. Advancing to REVIEW_SPEC."
+                SPEC_ID=$(state '.spec_id')
+                jq --arg time "$(date -Iseconds)" \
+                   '.current_state = "CREATE_SPEC" | .last_transition = $time | .last_result.verdict = "SPEC_CREATED"' \
                    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
                 continue
             fi
@@ -423,6 +465,9 @@ while true; do
                 fi
 
                 echo "  PR #$PR_NUM: processing..."
+                # Fix attempt counter (not persisted — resets if loop crashes and restarts)
+                FIX_ATTEMPT=0
+                MAX_FIX_ATTEMPTS=3
 
                 # ── Phase 0: Rebase PR branch onto current main ──
                 PR_DATA=$(gh pr view "$PR_NUM" --json headRefName,state 2>/dev/null || echo '{}')
@@ -600,19 +645,104 @@ while true; do
 
                     # Check failure or changes requested
                     if [ "$CHECKS_PASSED" = false ]; then
-                        if [ "$FAILED_CHECKS" -gt 0 ]; then
-                            MERGE_BLOCKERS+=("PR #$PR_NUM: GHA check(s) failed")
+                        if [ "$FAILED_CHECKS" -gt 0 ] && [ "$FIX_ATTEMPT" -lt "$MAX_FIX_ATTEMPTS" ]; then
+                            # ── Arbiter fix cycle ──
+                            FIX_ATTEMPT=$((FIX_ATTEMPT + 1))
+                            echo "    Arbiter fix attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS..."
+
+                            enrich_ci_context "$PR_NUM" "$FIX_ATTEMPT" "$MAX_FIX_ATTEMPTS"
+
+                            # Checkout PR branch for arbiter to work on
+                            PR_FIX_BRANCH=$(gh pr view "$PR_NUM" --json headRefName -q '.headRefName' 2>/dev/null)
+                            git checkout "$PR_FIX_BRANCH" 2>/dev/null || true
+                            git pull origin "$PR_FIX_BRANCH" 2>/dev/null || true
+                            PRE_ARBITER_HEAD=$(git rev-parse HEAD 2>/dev/null)
+
+                            if [ -z "$PRE_ARBITER_HEAD" ]; then
+                                echo "    x Failed to capture PRE_ARBITER_HEAD"
+                                git checkout main 2>/dev/null || true
+                                MERGE_BLOCKERS+=("PR #$PR_NUM: failed to capture safety anchor")
+                                MERGE_FAILED=$((MERGE_FAILED + 1))
+                                break
+                            fi
+
+                            if dispatch "/order-arbiter"; then
+                                ARB_VERDICT=$(state '.last_result.verdict')
+
+                                case "$ARB_VERDICT" in
+                                    FIXED)
+                                        echo "    Arbiter: FIXED. Dispatching review..."
+                                        if dispatch "/arbiter-review"; then
+                                            REVIEW_VERDICT=$(state '.last_result.review')
+                                            if [ "$REVIEW_VERDICT" = "APPROVED" ]; then
+                                                echo "    Review: APPROVED. Pushing fix..."
+                                                if git push origin "$PR_FIX_BRANCH" 2>/dev/null; then
+                                                    echo "    Fix pushed. Re-polling checks..."
+                                                    git checkout main 2>/dev/null || true
+                                                    # Wait for GHA to trigger on push event
+                                                    sleep 15
+                                                    continue  # re-enter check polling loop
+                                                else
+                                                    echo "    x Push failed. Reverting..."
+                                                    git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
+                                                    git checkout main 2>/dev/null || true
+                                                    MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter fix push failed")
+                                                    MERGE_FAILED=$((MERGE_FAILED + 1))
+                                                    break
+                                                fi
+                                            else
+                                                REVIEW_REASON=$(state '.last_result.review_reason // "no reason"')
+                                                echo "    Review: REJECTED — $REVIEW_REASON"
+                                                git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
+                                                git checkout main 2>/dev/null || true
+                                                MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter fix rejected by review — $REVIEW_REASON")
+                                                MERGE_FAILED=$((MERGE_FAILED + 1))
+                                                break
+                                            fi
+                                        else
+                                            echo "    x /arbiter-review crashed. Reverting..."
+                                            git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
+                                            git checkout main 2>/dev/null || true
+                                            MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter-review crashed")
+                                            MERGE_FAILED=$((MERGE_FAILED + 1))
+                                            break
+                                        fi
+                                        ;;
+                                    *)
+                                        echo "    Arbiter: $ARB_VERDICT. Reverting..."
+                                        git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
+                                        git checkout main 2>/dev/null || true
+                                        MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter verdict $ARB_VERDICT")
+                                        MERGE_FAILED=$((MERGE_FAILED + 1))
+                                        break
+                                        ;;
+                                esac
+                            else
+                                echo "    x /order-arbiter crashed. Reverting..."
+                                git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
+                                git checkout main 2>/dev/null || true
+                                MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter crashed")
+                                MERGE_FAILED=$((MERGE_FAILED + 1))
+                                break
+                            fi
+
+                        elif [ "$FAILED_CHECKS" -gt 0 ]; then
+                            # Max fix attempts exhausted — fall through to manual intervention
+                            echo "    x Max fix attempts ($MAX_FIX_ATTEMPTS) exhausted for PR #$PR_NUM."
+                            MERGE_BLOCKERS+=("PR #$PR_NUM: GHA check(s) failed after $MAX_FIX_ATTEMPTS fix attempts")
                             jq --arg pr "$PR_NUM" \
                                '.prs[$pr].status = "checks_failed"' \
                                "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                            MERGE_FAILED=$((MERGE_FAILED + 1))
+                            break
                         else
                             MERGE_BLOCKERS+=("PR #$PR_NUM: review requested changes")
                             jq --arg pr "$PR_NUM" \
                                '.prs[$pr].status = "changes_requested"' \
                                "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                            MERGE_FAILED=$((MERGE_FAILED + 1))
+                            break
                         fi
-                        MERGE_FAILED=$((MERGE_FAILED + 1))
-                        break
                     fi
 
                     # ── Phase 3: Address review feedback ──
@@ -693,16 +823,34 @@ while true; do
                         # Keep local main current for subsequent PRs
                         git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
                     else
-                        echo "    x PR #$PR_NUM: merge command failed."
-                        MERGE_FAILED=$((MERGE_FAILED + 1))
-                        MERGE_BLOCKERS+=("PR #$PR_NUM: gh pr merge command failed")
-                        jq --arg pr "$PR_NUM" \
-                           '.prs[$pr].status = "merge_failed"' \
-                           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                        # gh pr merge can return non-zero even when the PR was merged.
+                        # Verify the actual PR state before declaring failure.
+                        sleep 3
+                        ACTUAL_STATE=$(gh pr view "$PR_NUM" --json state -q '.state' 2>/dev/null || echo "UNKNOWN")
+                        if [ "$ACTUAL_STATE" = "MERGED" ]; then
+                            echo "    PR #$PR_NUM: merge command returned error but PR is MERGED. Continuing."
+                            MERGE_SUCCEEDED=$((MERGE_SUCCEEDED + 1))
+                            jq --arg pr "$PR_NUM" \
+                               '.prs[$pr].status = "merged"' \
+                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                            git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
+                        else
+                            echo "    x PR #$PR_NUM: merge command failed (state: $ACTUAL_STATE)."
+                            MERGE_FAILED=$((MERGE_FAILED + 1))
+                            MERGE_BLOCKERS+=("PR #$PR_NUM: gh pr merge command failed")
+                            jq --arg pr "$PR_NUM" \
+                               '.prs[$pr].status = "merge_failed"' \
+                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                        fi
                     fi
                 fi
 
             done  # PR loop
+
+            # Cleanup stale arbiter_context — runs on all exit paths (success, failure, timeout)
+            if jq -e '.arbiter_context' "$STATE_FILE" >/dev/null 2>&1; then
+                jq 'del(.arbiter_context)' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+            fi
 
             echo "  Merge results: $MERGE_SUCCEEDED merged, $MERGE_FAILED failed"
 
