@@ -17,6 +17,8 @@ pr_workflow:
   merge_method: squash         # squash | merge | rebase
   delete_branch: true          # Delete branch after merge
   post_merge_learn: true       # Run /learn after each merge
+  max_fix_attempts: 3          # Max arbiter CI fix attempts per PR
+  max_feedback_rounds: 5       # Max review feedback rounds per PR
 
 # Task decomposition settings (for /plan-work)
 task_decomposition:
