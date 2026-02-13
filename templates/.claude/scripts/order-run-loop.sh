@@ -163,7 +163,11 @@ archive_transitions() {
     local archive_count=$((count - HISTORY_KEEP))
 
     # Append older entries to JSONL archive (one JSON object per line)
-    jq -c ".transition_history[:$archive_count][]" "$STATE_FILE" >> "$HISTORY_ARCHIVE"
+    # Check append success before truncating to avoid data loss
+    if ! jq -c ".transition_history[:$archive_count][]" "$STATE_FILE" >> "$HISTORY_ARCHIVE"; then
+        echo "  x Warning: Failed to append to $HISTORY_ARCHIVE, skipping archive."
+        return 1
+    fi
 
     # Keep only the last N entries in state.json
     jq --argjson keep "$HISTORY_KEEP" \
@@ -201,7 +205,7 @@ auto_fix_formatting() {
         (cd web && npx eslint . --fix 2>/dev/null || true)
         (cd web && npx prettier --write "src/**/*.{ts,tsx,css}" 2>/dev/null || true)
         if ! git diff --quiet -- web/ 2>/dev/null; then
-            git add web/src/
+            git diff --name-only -- web/ | xargs -r git add
             changed=true
         fi
     fi
@@ -211,7 +215,7 @@ auto_fix_formatting() {
         echo "    Running go fmt..."
         go fmt ./... 2>/dev/null || true
         if ! git diff --quiet 2>/dev/null; then
-            git add internal/ cmd/ migrations/ 2>/dev/null || true
+            git diff --name-only -- '*.go' 'go.mod' 'go.sum' | xargs -r git add
             changed=true
         fi
     fi
@@ -251,12 +255,12 @@ try_simple_conflict_resolution() {
         ours=$(sed -n '/^<<<<<<</,/^=======/p' "$cfile" 2>/dev/null | sed '1d;$d')
         theirs=$(sed -n '/^=======/,/^>>>>>>>/p' "$cfile" 2>/dev/null | sed '1d;$d')
 
-        # Check if one side contains all content of the other
-        if echo "$ours" | grep -qF "$theirs" 2>/dev/null; then
+        # Check if one side is a strict superset of the other (all lines present)
+        if diff <(echo "$theirs" | sort) <(echo "$ours" | grep -Fxf <(echo "$theirs") | sort) &>/dev/null; then
             git checkout --ours "$cfile" 2>/dev/null
             git add "$cfile"
             echo "      Simple-resolved $cfile (HEAD superset)"
-        elif echo "$theirs" | grep -qF "$ours" 2>/dev/null; then
+        elif diff <(echo "$ours" | sort) <(echo "$theirs" | grep -Fxf <(echo "$ours") | sort) &>/dev/null; then
             git checkout --theirs "$cfile" 2>/dev/null
             git add "$cfile"
             echo "      Simple-resolved $cfile (PR superset)"
