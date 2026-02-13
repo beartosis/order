@@ -23,6 +23,8 @@ STATE_FILE=".chaos/framework/order/state.json"
 CONFIG_FILE=".chaos/framework/order/config.yml"
 QUEUE_FILE=".chaos/framework/order/queue.txt"
 KILL_FILE=".chaos/framework/order/STOP"
+HISTORY_ARCHIVE=".chaos/framework/order/history.jsonl"
+HISTORY_KEEP=20
 
 # ── Defaults ──────────────────────────────────────────────────────
 WORK_MODEL="${WORK_MODEL:-sonnet}"
@@ -120,6 +122,150 @@ enrich_ci_context() {
             max_fix_attempts: $max
         }' \
        "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+    # Capture CI failure logs to sidecar file
+    local log_file=".chaos/framework/order/ci-failure-${pr_num}.log"
+    {
+        echo "=== CI Failure Context for PR #${pr_num} ==="
+        echo "Timestamp: $(date -Iseconds)"
+        echo "Fix attempt: ${fix_attempt}/${max_attempts}"
+        echo "Branch: ${pr_branch}"
+        echo ""
+    } > "$log_file"
+
+    local repo
+    repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
+
+    if [ -n "$repo" ] && [ "$enriched_checks" != "[]" ] && [ -n "$enriched_checks" ]; then
+        for job_id in $(echo "$enriched_checks" | jq -r '.[].job_id // empty'); do
+            [ -z "$job_id" ] && continue
+            local job_name
+            job_name=$(echo "$enriched_checks" | jq -r --arg jid "$job_id" \
+                '.[] | select(.job_id == $jid) | .name // "unknown"')
+            echo "--- Check: $job_name (job $job_id) ---" >> "$log_file"
+            gh api "repos/$repo/actions/jobs/$job_id/logs" 2>/dev/null \
+                | tail -100 >> "$log_file" \
+                || echo "  (failed to fetch logs)" >> "$log_file"
+            echo "" >> "$log_file"
+        done
+    fi
+
+    echo "    CI failure context saved to $log_file"
+}
+
+# Archive old transition_history entries to keep state.json minimal.
+# Keeps last HISTORY_KEEP entries in state.json, appends older to JSONL.
+archive_transitions() {
+    local count
+    count=$(jq '.transition_history | length' "$STATE_FILE" 2>/dev/null || echo "0")
+    [ "$count" -le "$HISTORY_KEEP" ] && return 0
+
+    local archive_count=$((count - HISTORY_KEEP))
+
+    # Append older entries to JSONL archive (one JSON object per line)
+    jq -c ".transition_history[:$archive_count][]" "$STATE_FILE" >> "$HISTORY_ARCHIVE"
+
+    # Keep only the last N entries in state.json
+    jq --argjson keep "$HISTORY_KEEP" \
+       '.transition_history = .transition_history[-$keep:]' \
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+    echo "  Archived $archive_count transitions to $HISTORY_ARCHIVE"
+}
+
+# Print essential state fields (avoids reading full state.json)
+state_summary() {
+    jq '{
+        current_state,
+        step_number,
+        last_transition,
+        last_result,
+        spec_id,
+        consecutive_failures,
+        completed_count: (.completed // [] | length),
+        failed_count: (.failed // [] | length),
+        open_prs: [.prs // {} | to_entries[] | select(.value.status != "merged") | .key],
+        history_len: (.transition_history | length)
+    }' "$STATE_FILE"
+}
+
+# Auto-fix lint and formatting before marking PR ready.
+# Runs on the PR branch. Commits and pushes if changes made.
+auto_fix_formatting() {
+    local pr_branch="$1"
+    local changed=false
+
+    # Frontend (web/)
+    if [ -d "web" ] && [ -f "web/package.json" ]; then
+        echo "    Running frontend lint:fix + prettier..."
+        (cd web && npx eslint . --fix 2>/dev/null || true)
+        (cd web && npx prettier --write "src/**/*.{ts,tsx,css}" 2>/dev/null || true)
+        if ! git diff --quiet -- web/ 2>/dev/null; then
+            git add web/src/
+            changed=true
+        fi
+    fi
+
+    # Go
+    if [ -f "go.mod" ]; then
+        echo "    Running go fmt..."
+        go fmt ./... 2>/dev/null || true
+        if ! git diff --quiet 2>/dev/null; then
+            git add internal/ cmd/ migrations/ 2>/dev/null || true
+            changed=true
+        fi
+    fi
+
+    if [ "$changed" = true ]; then
+        git commit -m "style: auto-fix lint and formatting" 2>/dev/null || true
+        git push origin "$pr_branch" 2>/dev/null || true
+        echo "    Auto-fix committed and pushed."
+    else
+        echo "    No formatting changes needed."
+    fi
+}
+
+# Attempt simple conflict resolution for add/add conflicts where one side
+# is a strict superset of the other (e.g., HEAD has extra struct tags).
+# Returns 0 if ALL conflicts in the current rebase step were resolved.
+try_simple_conflict_resolution() {
+    local conflict_files
+    conflict_files=$(git diff --name-only --diff-filter=U 2>/dev/null)
+    [ -z "$conflict_files" ] && return 1
+
+    local all_resolved=true
+
+    while IFS= read -r cfile; do
+        [ -z "$cfile" ] && continue
+
+        # Only handle files with a single conflict block
+        local block_count
+        block_count=$(grep -c '^<<<<<<<' "$cfile" 2>/dev/null || echo "0")
+        if [ "$block_count" -ne 1 ]; then
+            all_resolved=false
+            continue
+        fi
+
+        # Extract ours (HEAD/main) and theirs (PR branch) content
+        local ours theirs
+        ours=$(sed -n '/^<<<<<<</,/^=======/p' "$cfile" 2>/dev/null | sed '1d;$d')
+        theirs=$(sed -n '/^=======/,/^>>>>>>>/p' "$cfile" 2>/dev/null | sed '1d;$d')
+
+        # Check if one side contains all content of the other
+        if echo "$ours" | grep -qF "$theirs" 2>/dev/null; then
+            git checkout --ours "$cfile" 2>/dev/null
+            git add "$cfile"
+            echo "      Simple-resolved $cfile (HEAD superset)"
+        elif echo "$theirs" | grep -qF "$ours" 2>/dev/null; then
+            git checkout --theirs "$cfile" 2>/dev/null
+            git add "$cfile"
+            echo "      Simple-resolved $cfile (PR superset)"
+        else
+            all_resolved=false
+        fi
+    done <<< "$conflict_files"
+
+    [ "$all_resolved" = true ]
 }
 
 # ── Initialization ────────────────────────────────────────────────
@@ -142,6 +288,7 @@ echo ""
 
 while true; do
     preflight
+    archive_transitions
 
     CURRENT=$(state '.current_state')
     VERDICT=$(state '.last_result.verdict')
@@ -375,7 +522,7 @@ while true; do
             GHA_TIMEOUT=$(config "gha_wait_timeout_minutes" "30")
             MERGE_METHOD=$(config "merge_method" "squash")
             DELETE_BRANCH=$(config "delete_branch" "true")
-            MAX_FEEDBACK_ROUNDS=5
+            MAX_FEEDBACK_ROUNDS=$(config "max_feedback_rounds" "5")
             POLL_INTERVAL=120  # 2 minutes
 
             # Ensure TODO directory exists for review artifacts
@@ -467,7 +614,7 @@ while true; do
                 echo "  PR #$PR_NUM: processing..."
                 # Fix attempt counter (not persisted — resets if loop crashes and restarts)
                 FIX_ATTEMPT=0
-                MAX_FIX_ATTEMPTS=3
+                MAX_FIX_ATTEMPTS=$(config "max_fix_attempts" "3")
 
                 # ── Phase 0: Rebase PR branch onto current main ──
                 PR_DATA=$(gh pr view "$PR_NUM" --json headRefName,state 2>/dev/null || echo '{}')
@@ -510,47 +657,83 @@ while true; do
                                 continue
                             fi
                         else
-                            echo "    Rebase conflict for PR #$PR_NUM. Attempting resolution..."
+                            echo "    Rebase conflict for PR #$PR_NUM. Attempting simple resolution..."
+                            REBASE_DONE=false
 
-                            # Capture conflict files while rebase is in progress
-                            CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null \
-                                | jq -R . | jq -s .)
+                            # Try simple resolution first (handles add/add superset conflicts)
+                            if try_simple_conflict_resolution; then
+                                echo "    All conflicts resolved simply. Continuing rebase..."
+                                if GIT_EDITOR=true git rebase --continue 2>/dev/null; then
+                                    if [ ! -d ".git/rebase-merge" ] && [ ! -d ".git/rebase-apply" ]; then
+                                        echo "    Rebase complete via simple resolution."
+                                        if git push --force-with-lease origin "$PR_BRANCH" 2>/dev/null; then
+                                            echo "    Force-push succeeded."
+                                            REBASE_DONE=true
+                                        else
+                                            echo "    x Force-push failed after simple resolution."
+                                            git checkout main 2>/dev/null || true
+                                            MERGE_FAILED=$((MERGE_FAILED + 1))
+                                            MERGE_BLOCKERS+=("PR #$PR_NUM: force-push failed after simple resolution")
+                                            jq --arg pr "$PR_NUM" \
+                                               '.prs[$pr].status = "rebase_failed"' \
+                                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                                            continue
+                                        fi
+                                    fi
+                                fi
+                            fi
 
-                            # Write conflict context to state.json for the skill
-                            jq --arg pr "$PR_NUM" \
-                               --arg branch "$PR_BRANCH" \
-                               --argjson files "${CONFLICT_FILES:-[]}" \
-                               '.conflict_context = {pr_number: $pr, branch: $branch, conflict_files: $files}' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                            # Fall through to /resolve-conflicts for complex conflicts
+                            if [ "$REBASE_DONE" = false ]; then
+                                if [ ! -d ".git/rebase-merge" ] && [ ! -d ".git/rebase-apply" ]; then
+                                    # Simple resolution partially worked but rebase finished with errors — restart
+                                    echo "    Restarting rebase for full conflict resolution..."
+                                    git rebase --abort 2>/dev/null || true
+                                    git rebase origin/main 2>/dev/null || true
+                                fi
 
-                            # Dispatch — rebase-in-progress state persists on disk
-                            if dispatch "/resolve-conflicts"; then
-                                RESOLVE_VERDICT=$(state '.last_result.verdict')
-                                if [ "$RESOLVE_VERDICT" = "RESOLVED" ]; then
-                                    echo "    Conflicts resolved for PR #$PR_NUM."
-                                    git checkout main 2>/dev/null || true
-                                    # Continue to Phase 1 (mark ready, poll, merge)
+                                echo "    Complex conflicts remain. Dispatching /resolve-conflicts..."
+
+                                # Capture conflict files while rebase is in progress
+                                CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null \
+                                    | jq -R . | jq -s .)
+
+                                # Write conflict context to state.json for the skill
+                                jq --arg pr "$PR_NUM" \
+                                   --arg branch "$PR_BRANCH" \
+                                   --argjson files "${CONFLICT_FILES:-[]}" \
+                                   '.conflict_context = {pr_number: $pr, branch: $branch, conflict_files: $files}' \
+                                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+                                # Dispatch — rebase-in-progress state persists on disk
+                                if dispatch "/resolve-conflicts"; then
+                                    RESOLVE_VERDICT=$(state '.last_result.verdict')
+                                    if [ "$RESOLVE_VERDICT" = "RESOLVED" ]; then
+                                        echo "    Conflicts resolved for PR #$PR_NUM."
+                                        git checkout main 2>/dev/null || true
+                                        # Continue to Phase 1 (mark ready, poll, merge)
+                                    else
+                                        echo "    x Resolution returned: $RESOLVE_VERDICT"
+                                        git rebase --abort 2>/dev/null || true
+                                        git checkout main 2>/dev/null || true
+                                        MERGE_FAILED=$((MERGE_FAILED + 1))
+                                        MERGE_BLOCKERS+=("PR #$PR_NUM: conflict unresolvable")
+                                        jq --arg pr "$PR_NUM" \
+                                           '.prs[$pr].status = "rebase_conflict"' \
+                                           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                                        continue
+                                    fi
                                 else
-                                    echo "    x Resolution returned: $RESOLVE_VERDICT"
+                                    echo "    x /resolve-conflicts crashed for PR #$PR_NUM."
                                     git rebase --abort 2>/dev/null || true
                                     git checkout main 2>/dev/null || true
                                     MERGE_FAILED=$((MERGE_FAILED + 1))
-                                    MERGE_BLOCKERS+=("PR #$PR_NUM: conflict unresolvable")
+                                    MERGE_BLOCKERS+=("PR #$PR_NUM: resolve-conflicts crashed")
                                     jq --arg pr "$PR_NUM" \
                                        '.prs[$pr].status = "rebase_conflict"' \
                                        "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
                                     continue
                                 fi
-                            else
-                                echo "    x /resolve-conflicts crashed for PR #$PR_NUM."
-                                git rebase --abort 2>/dev/null || true
-                                git checkout main 2>/dev/null || true
-                                MERGE_FAILED=$((MERGE_FAILED + 1))
-                                MERGE_BLOCKERS+=("PR #$PR_NUM: resolve-conflicts crashed")
-                                jq --arg pr "$PR_NUM" \
-                                   '.prs[$pr].status = "rebase_conflict"' \
-                                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                                continue
                             fi
                         fi
 
@@ -560,6 +743,16 @@ while true; do
 
                     # Brief pause for GHA to trigger on synchronize event from rebase
                     sleep 10
+                fi
+
+                # ── Phase 0.5: Auto-fix lint and formatting ──
+                if [ -n "$PR_BRANCH" ] && [ "$PR_STATE" = "OPEN" ]; then
+                    echo "    Auto-fixing lint/formatting on $PR_BRANCH..."
+                    git checkout "$PR_BRANCH" 2>/dev/null || true
+                    git pull origin "$PR_BRANCH" 2>/dev/null || true
+                    auto_fix_formatting "$PR_BRANCH"
+                    git checkout main 2>/dev/null || true
+                    sleep 5
                 fi
 
                 # ── Phase 1: Mark draft as ready for review ──
@@ -851,6 +1044,16 @@ while true; do
             if jq -e '.arbiter_context' "$STATE_FILE" >/dev/null 2>&1; then
                 jq 'del(.arbiter_context)' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
             fi
+
+            # Cleanup CI failure logs for merged PRs
+            for ci_log in .chaos/framework/order/ci-failure-*.log; do
+                [ -f "$ci_log" ] || continue
+                log_pr=$(basename "$ci_log" | sed 's/ci-failure-\([0-9]*\)\.log/\1/')
+                log_status=$(jq -r ".prs[\"$log_pr\"].status // \"unknown\"" "$STATE_FILE" 2>/dev/null)
+                if [ "$log_status" = "merged" ]; then
+                    rm -f "$ci_log"
+                fi
+            done
 
             echo "  Merge results: $MERGE_SUCCEEDED merged, $MERGE_FAILED failed"
 
