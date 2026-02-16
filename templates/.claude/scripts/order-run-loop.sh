@@ -1657,6 +1657,21 @@ while true; do
                 log INFO "Pulling latest main after merge"
                 git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
 
+                # Mark ROADMAP step as complete [X] at merge time (not just at handoff).
+                # This prevents restart loops from re-attempting already-merged work.
+                if [ "$REMAINING" -eq 0 ]; then
+                    STEP=$(state '.step_number')
+                    if [ -n "$STEP" ] && [ -f "docs/ROADMAP.md" ]; then
+                        if grep -qP "^${STEP}\\. \\[ \\]" docs/ROADMAP.md; then
+                            sed -i "s/^${STEP}\\. \\[ \\]/${STEP}. [X]/" docs/ROADMAP.md
+                            git add docs/ROADMAP.md 2>/dev/null || true
+                            git commit -m "chore: mark step ${STEP} complete in ROADMAP" 2>/dev/null || true
+                            git push origin main 2>/dev/null || true
+                            log INFO "ROADMAP: step ${STEP} marked [X]"
+                        fi
+                    fi
+                fi
+
                 if [ "$REMAINING" -gt 0 ]; then
                     log INFO "$REMAINING task(s) remaining. Continuing to next task."
                     jq --arg time "$(date -Iseconds)" \
