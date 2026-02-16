@@ -1,0 +1,243 @@
+---
+name: resolve-conflicts
+description: |
+  Resolve git rebase conflicts intelligently during ORDER's MERGE_PRS phase.
+  Reads conflict markers, applies resolution strategies per file type, continues
+  rebase through multiple commits, validates with tests, and force-pushes.
+  INTERNAL - invoked by order-run-loop.sh on rebase conflicts.
+model: sonnet
+context: fork
+allowed-tools: Read, Write, Edit, Bash, Grep, Glob
+disable-model-invocation: true
+user-invocable: false
+---
+
+# Resolve Conflicts
+
+You are the autonomous conflict resolution handler for ORDER. When a PR branch cannot cleanly rebase onto main, you resolve the conflicts intelligently and continue the pipeline.
+
+> **Note**: In sequential execution mode, conflicts should be rare. Each task branches from the latest merged main, so conflicts only occur from external commits to main between task start and merge. This skill remains as a safety net for those edge cases.
+
+## Quick Discovery
+
+```bash
+cat .chaos/framework/order/state.json    # PR context and conflict info
+cat .chaos/framework/order/config.yml    # Behavior settings
+```
+
+## Prerequisites
+
+A git rebase is in progress. Verify this immediately:
+
+```bash
+if [ ! -d ".git/rebase-merge" ] && [ ! -d ".git/rebase-apply" ]; then
+  echo "FATAL: No rebase in progress."
+fi
+```
+
+If no rebase is in progress, write an UNRESOLVABLE verdict to state.json and exit:
+
+```bash
+jq --arg time "$(date -Iseconds)" \
+   '.last_result = {skill: "resolve-conflicts", verdict: "UNRESOLVABLE", reason: "No rebase in progress"} | del(.conflict_context)' \
+   .chaos/framework/order/state.json > .chaos/framework/order/state.json.tmp \
+   && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+## Step 1: Read Context
+
+Read `.chaos/framework/order/state.json` and extract:
+- `.conflict_context.pr_number` — the PR being rebased
+- `.conflict_context.branch` — the branch name
+- `.conflict_context.conflict_files` — initial list of conflicted files
+
+Also check what the PR's task is (from `.prs[pr_number].task`) to understand the PR's intent.
+
+## Step 2: Identify Conflicted Files
+
+```bash
+git diff --name-only --diff-filter=U
+```
+
+Read each conflicted file in full to see the conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`).
+
+## Step 3: Resolve Each Conflicted File
+
+For each file with conflict markers, apply the appropriate resolution strategy.
+
+### Strategy A: go.mod / go.sum
+
+1. For shared dependency lines, accept the version from HEAD (main) unless the PR adds a newer version
+2. Keep any new dependencies added by the PR branch (the incoming change)
+3. For version conflicts on the same dependency, prefer the higher version
+4. After resolving markers: run `go mod tidy` to regenerate go.sum
+5. Stage both go.mod and go.sum
+
+### Strategy B: Import Block Conflicts (Go files)
+
+1. Identify import blocks by `import (` ... `)` boundaries
+2. Merge both import lists, removing duplicates
+3. Preserve import grouping: stdlib first, then external, then internal
+4. Preserve any import aliases
+
+### Strategy C: Identical / Duplicate Changes
+
+When both sides introduce the same code (common when PRs branch from the same base):
+1. Compare content between `<<<<<<<`/`=======` and `=======/>>>>>>>`
+2. If identical or near-identical (whitespace only): keep one copy
+3. Remove all conflict markers
+
+### Strategy D: Non-Overlapping Additions
+
+When both sides add different code in adjacent regions:
+1. Determine logical ordering (alphabetical for declarations, chronological for entries)
+2. Include both additions in appropriate order
+3. Ensure no duplicate function names, variable declarations, or type definitions
+
+### Strategy E: Main Supersedes PR Branch
+
+When HEAD (main) has a clearly improved version of code the PR also modified:
+1. Detect if the incoming (PR) side is an older/simpler version of what HEAD already has
+2. Prefer HEAD's version — it was reviewed and merged more recently
+3. Verify the PR's intent is still satisfied (the feature the PR adds is not lost)
+
+### Strategy F: Test File Conflicts
+
+1. Apply the same logic as source files
+2. If test function names conflict, keep both (they test different things)
+3. If test helper/fixture conflicts, merge carefully preserving both test cases
+
+### Strategy G: Configuration Files (.env.example, .gitignore, YAML)
+
+1. Merge both sides, removing duplicate lines
+2. Preserve comments and section organization from HEAD
+3. Add any new entries from the PR branch
+
+### General Resolution Rules
+
+1. **Read both sides carefully** before deciding. Understand what each side intended.
+2. **Never silently drop functionality.** If the PR added a feature, that feature must survive.
+3. **When truly ambiguous**, prefer HEAD's version (main — reviewed and merged more recently).
+4. **After resolving each file**, verify no conflict markers remain: search for `<<<<<<<`, `=======`, `>>>>>>>`.
+
+## Step 4: Stage and Continue Rebase
+
+After resolving ALL conflicted files for the current commit:
+
+```bash
+# Stage resolved files
+git add <file1> <file2> ...
+
+# Verify no remaining conflict markers in staged files
+for f in $(git diff --cached --name-only); do
+  if grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$f" 2>/dev/null; then
+    echo "FATAL: Unresolved markers in $f"
+  fi
+done
+
+# Continue the rebase (use --no-edit to accept existing commit message)
+GIT_EDITOR=true git rebase --continue
+```
+
+**Multi-commit rebase handling**: After `git rebase --continue`, the rebase may stop again on the next commit with new conflicts. Check:
+
+```bash
+if [ -d ".git/rebase-merge" ] || [ -d ".git/rebase-apply" ]; then
+  # More conflicts — go back to Step 2
+fi
+```
+
+Repeat Steps 2-4 until the rebase completes (no `.git/rebase-merge/` directory exists).
+
+**Safety limit**: If you have resolved conflicts across more than 10 commits in a single rebase, abort and return UNRESOLVABLE.
+
+## Step 5: Post-Rebase Cleanup
+
+If any commit in the rebase touched go.mod or go.sum:
+
+```bash
+go mod tidy
+```
+
+If `go mod tidy` produces changes:
+
+```bash
+git add go.mod go.sum
+if ! git diff --cached --quiet; then
+  git commit --amend --no-edit
+fi
+```
+
+## Step 6: Run Tests
+
+```bash
+# Run project-specific test command
+bash .claude/scripts/run-tests.sh 2>&1 || true
+```
+
+If tests fail:
+1. Read the test output carefully
+2. If the failure is clearly caused by a bad merge resolution, fix the file and re-run
+3. If the failure appears pre-existing and unrelated to the merge, note it but proceed
+4. If you cannot fix test failures after one attempt, abort and write UNRESOLVABLE
+
+## Step 7: Force Push
+
+```bash
+BRANCH=$(jq -r '.conflict_context.branch' .chaos/framework/order/state.json)
+git push --force-with-lease origin "$BRANCH"
+```
+
+If force-push fails, write UNRESOLVABLE verdict.
+
+## Step 8: Write Verdict
+
+### On Success
+
+All conflicts resolved, tests pass, push succeeded:
+
+```bash
+PR_NUM=$(jq -r '.conflict_context.pr_number' .chaos/framework/order/state.json)
+jq --arg time "$(date -Iseconds)" \
+   --arg pr "$PR_NUM" \
+   '.last_result = {skill: "resolve-conflicts", verdict: "RESOLVED", pr: $pr, resolved_at: $time} | del(.conflict_context)' \
+   .chaos/framework/order/state.json > .chaos/framework/order/state.json.tmp \
+   && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+### On Failure
+
+Cannot resolve, tests fail persistently, or push fails:
+
+```bash
+git rebase --abort 2>/dev/null || true
+git checkout main 2>/dev/null || true
+
+PR_NUM=$(jq -r '.conflict_context.pr_number' .chaos/framework/order/state.json)
+jq --arg time "$(date -Iseconds)" \
+   --arg pr "$PR_NUM" \
+   --arg reason "<specific reason for failure>" \
+   '.last_result = {skill: "resolve-conflicts", verdict: "UNRESOLVABLE", pr: $pr, reason: $reason, failed_at: $time} | del(.conflict_context)' \
+   .chaos/framework/order/state.json > .chaos/framework/order/state.json.tmp \
+   && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+## Error Recovery
+
+If the skill process crashes mid-resolution:
+- The rebase stays in progress on disk (`.git/rebase-merge/` persists)
+- The loop detects the skill failure (non-zero exit) and falls through to cleanup
+- The loop runs `git rebase --abort` and `git checkout main` to restore clean state
+
+## CRITICAL Rules
+
+1. **Never use AskUserQuestion** — you have no access to this tool
+2. **Never drop PR functionality** — the PR's feature must survive the merge
+3. **Prefer HEAD (main) when ambiguous** — it was reviewed and merged more recently
+4. **Verify no conflict markers remain** — search every resolved file before staging
+5. **Handle multi-commit rebases** — loop until rebase completes or abort
+6. **Always write a verdict** — RESOLVED or UNRESOLVABLE, no silent exits
+7. **Always clean up on failure** — `git rebase --abort` then `git checkout main`
+8. **Run tests after resolution** — broken merges must be caught before push
+9. **Safety limit** — abort after 10 conflict-commits to prevent runaway loops
+10. **Use GIT_EDITOR=true** — prevents interactive editor prompts during `git rebase --continue`

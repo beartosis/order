@@ -1,12 +1,12 @@
 #!/bin/bash
-# order-run-loop.sh — ORDER Lifecycle Orchestrator
+# order-run-loop.sh — ORDER Lifecycle Orchestrator v3.0
 #
-# The real state machine dispatcher. Reads state.json, dispatches each
+# The state machine dispatcher. Reads state.json, dispatches each
 # skill via `claude -p` (fresh process per skill), reads state.json for
 # the result, repeats. Handles the full lifecycle:
 #
-#   INIT -> /parse-roadmap -> /create-spec -> /review-spec -> /plan-work
-#        -> /work (per task) -> MERGE_PRS -> /verify-completion -> /handoff -> next step
+#   INIT -> PARSE_ROADMAP -> CREATE_SPEC -> REVIEW_SPEC -> PLAN_WORK
+#        -> EXECUTE_TASKS -> MERGE_PRS -> VERIFY_COMPLETION -> HANDOFF -> next step
 #
 # Usage:
 #   .claude/scripts/order-run-loop.sh [OPTIONS]
@@ -18,12 +18,15 @@
 # Environment:
 #   WORK_MODEL    Model for /work instances (default: sonnet)
 
+set -o pipefail
+
 # ── Paths ─────────────────────────────────────────────────────────
 STATE_FILE=".chaos/framework/order/state.json"
 CONFIG_FILE=".chaos/framework/order/config.yml"
 QUEUE_FILE=".chaos/framework/order/queue.txt"
 KILL_FILE=".chaos/framework/order/STOP"
 HISTORY_ARCHIVE=".chaos/framework/order/history.jsonl"
+LOG_DIR=".chaos/framework/order/logs"
 HISTORY_KEEP=20
 
 # ── Defaults ──────────────────────────────────────────────────────
@@ -32,6 +35,12 @@ MAX_STEPS=999
 START_STEP=""
 step_count=0
 revision_count=0
+LOG_FILE=""
+CURRENT=""
+CURRENT_STEP="?"
+
+# Shared merge state (used by MERGE_PRS sub-functions)
+MERGE_BLOCKERS=()
 
 # ── Argument Parsing ──────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -42,60 +51,524 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── Helper Functions ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════════
+
+init_logging() {
+    mkdir -p "$LOG_DIR"
+    local timestamp
+    timestamp=$(date +%Y%m%dT%H%M%S)
+    LOG_FILE="$LOG_DIR/order-run-${timestamp}.log"
+    ln -sf "$(basename "$LOG_FILE")" "$LOG_DIR/latest.log" 2>/dev/null || true
+}
+
+# Start a new log file for a specific step
+start_step_log() {
+    local step="$1" title="${2:-}"
+    local sanitized
+    sanitized=$(printf '%s' "$title" | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 40)
+    local timestamp
+    timestamp=$(date +%Y%m%dT%H%M%S)
+    local new_log="$LOG_DIR/step-${step}${sanitized:+-$sanitized}-${timestamp}.log"
+
+    # Copy init-phase entries to new log
+    if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
+        cp "$LOG_FILE" "$new_log"
+        # Keep the old init log too (don't delete)
+    fi
+
+    LOG_FILE="$new_log"
+    ln -sf "$(basename "$LOG_FILE")" "$LOG_DIR/latest.log" 2>/dev/null || true
+    log INFO "=== Step $step${title:+: $title} ==="
+    log INFO "Log file: $LOG_FILE"
+}
+
+# log LEVEL "message"
+# Levels: INFO, WARN, ERROR, DEBUG
+log() {
+    local level="$1"
+    shift
+    local timestamp
+    timestamp=$(date -Iseconds)
+    local line="[$timestamp] [$level] [step:${CURRENT_STEP}/${CURRENT:-?}] $*"
+
+    echo "$line"
+    [ -n "$LOG_FILE" ] && echo "$line" >> "$LOG_FILE"
+}
+
+log_separator() {
+    local msg="${1:-}"
+    log INFO "────────────────────────────────────────${msg:+ $msg ────}"
+}
+
+# Log full state summary
+log_state_summary() {
+    local summary
+    summary=$(jq -c '{
+        state: .current_state,
+        step: .step_number,
+        verdict: .last_result.verdict,
+        completed: (.completed // [] | length),
+        failed: (.failed // [] | length),
+        open_prs: [.prs // {} | to_entries[] | select(.value.status == "merged" | not) | .key]
+    }' "$STATE_FILE" 2>/dev/null || echo '{}')
+    log INFO "State: $summary"
+}
+
+# ══════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════
+
+# Safely replace state.json from the .tmp file after validating JSON.
+# Keeps a .bak copy so interrupted writes can be recovered on next startup.
+# Returns 1 if the tmp file contains invalid JSON.
+safe_mv_state() {
+    if jq empty "${STATE_FILE}.tmp" 2>/dev/null; then
+        cp "$STATE_FILE" "${STATE_FILE}.bak.tmp" 2>/dev/null || true
+        mv "${STATE_FILE}.bak.tmp" "${STATE_FILE}.bak" 2>/dev/null || true
+        mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    else
+        log ERROR "Refusing to update state: invalid JSON in ${STATE_FILE}.tmp"
+        rm -f "${STATE_FILE}.tmp"
+        return 1
+    fi
+}
 
 # Read a value from state.json via jq
 state() {
     jq -r "$1 // empty" "$STATE_FILE" 2>/dev/null
 }
 
-# Read a simple config value (grep for unique YAML key, return default if missing)
+# Read a config value from YAML. Matches the FIRST occurrence of the
+# key at any nesting level. Returns default if key is missing.
 config() {
     local key="$1" default="$2"
     local val
-    val=$(grep "${key}:" "$CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $2}' | tr -d "\"'")
+    # Match "key:" at any indent, extract the value after the colon
+    val=$(grep -E "^[[:space:]]*${key}:" "$CONFIG_FILE" 2>/dev/null \
+        | head -1 \
+        | sed 's/^[^:]*:[[:space:]]*//' \
+        | sed 's/[[:space:]]*#.*//' \
+        | tr -d "\"'" \
+        | xargs)
     echo "${val:-$default}"
 }
 
-# Dispatch a skill to a fresh Claude process
-dispatch() {
-    local skill="$1"
-    echo "  > $skill"
-    if ! claude -p "$skill" --dangerously-skip-permissions; then
-        echo "  x Failed: $skill (process error)"
-        return 1
+# ══════════════════════════════════════════════════════════════════
+# STATE HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+# Transition to a new state with optional note
+transition() {
+    local new_state="$1" note="${2:-}"
+    local old_state
+    old_state=$(state '.current_state')
+
+    local jq_filter='.current_state = $state | .last_transition = $time'
+    jq_filter="$jq_filter | .transition_history = (.transition_history + [{from: \$from, to: \$state, at: \$time"
+    if [ -n "$note" ]; then
+        jq_filter="$jq_filter, note: \$note"
     fi
+    jq_filter="$jq_filter}])"
+
+    jq --arg state "$new_state" \
+       --arg time "$(date -Iseconds)" \
+       --arg from "$old_state" \
+       --arg note "$note" \
+       "$jq_filter" \
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+
+    log INFO "Transition: $old_state -> $new_state${note:+ ($note)}"
+    CURRENT="$new_state"
 }
 
-# Safety checks before each dispatch
+# Update a PR's status in state.json
+update_pr_status() {
+    local pr_num="$1" status="$2"
+    jq --arg pr "$pr_num" --arg s "$status" \
+       '.prs[$pr].status = $s' \
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+    log DEBUG "PR #$pr_num status -> $status"
+}
+
+# Add a merge blocker message
+add_blocker() {
+    MERGE_BLOCKERS+=("$1")
+    log ERROR "Blocker: $1"
+}
+
+# Count non-comment, non-blank lines in queue file
+count_queue_tasks() {
+    local count
+    count=$(grep -cvE '^[[:space:]]*(#|$)' "$QUEUE_FILE" 2>/dev/null) || true
+    printf '%d' "${count:-0}"
+}
+
+# Print state summary for console output
+state_summary() {
+    jq '{
+        current_state,
+        step_number,
+        last_transition,
+        last_result,
+        spec_id,
+        consecutive_failures,
+        completed_count: (.completed // [] | length),
+        failed_count: (.failed // [] | length),
+        open_prs: [.prs // {} | to_entries[] | select(.value.status == "merged" | not) | .key],
+        history_len: (.transition_history | length)
+    }' "$STATE_FILE"
+}
+
+# Clean up dirty state left by a previous crash.
+# Called once during initialization, before the main loop.
+recover_dirty_state() {
+    log INFO "Running dirty state recovery..."
+
+    # Abort stale rebase
+    if [ -d ".git/rebase-merge" ] || [ -d ".git/rebase-apply" ]; then
+        log WARN "Stale rebase detected. Aborting."
+        git rebase --abort 2>/dev/null || true
+    fi
+
+    # Abort stale merge
+    if [ -f ".git/MERGE_HEAD" ]; then
+        log WARN "Stale merge detected. Aborting."
+        git merge --abort 2>/dev/null || true
+    fi
+
+    # Abort stale cherry-pick
+    if [ -f ".git/CHERRY_PICK_HEAD" ]; then
+        log WARN "Stale cherry-pick detected. Aborting."
+        git cherry-pick --abort 2>/dev/null || true
+    fi
+
+    # Ensure on main branch
+    local current_branch
+    current_branch=$(git branch --show-current 2>/dev/null || echo "")
+    if [ "$current_branch" != "main" ]; then
+        log WARN "Not on main branch (on: '${current_branch:-DETACHED}'). Switching to main."
+        git checkout main 2>/dev/null || {
+            log ERROR "Cannot checkout main. Forcing."
+            git checkout -f main 2>/dev/null || true
+        }
+    fi
+
+    # Pull latest main
+    git pull origin main 2>/dev/null || true
+
+    # Remove stale .tmp files
+    rm -f "${STATE_FILE}.tmp" "${STATE_FILE}.bak.tmp"
+    rm -f .chaos/framework/order/*.tmp 2>/dev/null || true
+    rm -f "$LOG_DIR"/dispatch-*.tmp 2>/dev/null || true
+
+    # Validate queue file if state expects one
+    local current_state
+    current_state=$(state '.current_state')
+    case "$current_state" in
+        PLAN_WORK|EXECUTE_TASKS|MERGE_PRS)
+            if [ ! -f "$QUEUE_FILE" ]; then
+                log WARN "State is $current_state but queue file missing. Resetting to INIT."
+                jq --arg time "$(date -Iseconds)" \
+                   '.current_state = "INIT" | .last_transition = $time | del(.last_result)' \
+                   "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+            fi
+            ;;
+    esac
+
+    # Validate spec file if state references one
+    local spec_id
+    spec_id=$(state '.spec_id // empty')
+    if [ -n "$spec_id" ]; then
+        case "$current_state" in
+            CREATE_SPEC|REVIEW_SPEC)
+                if [ ! -f "specs/$spec_id/SPEC.md" ]; then
+                    log WARN "State references spec $spec_id but file missing. Resetting to PARSE_ROADMAP."
+                    jq --arg time "$(date -Iseconds)" \
+                       '.current_state = "PARSE_ROADMAP" | .last_transition = $time | del(.last_result) | del(.spec_id)' \
+                       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+                fi
+                ;;
+        esac
+    fi
+
+    log INFO "Dirty state recovery complete."
+}
+
+# ══════════════════════════════════════════════════════════════════
+# DISPATCH
+# ══════════════════════════════════════════════════════════════════
+
+# Read dispatch_timeout_seconds from config with numeric validation
+get_dispatch_timeout() {
+    local t
+    t=$(config "dispatch_timeout_seconds" "1800")
+    if ! [[ "$t" =~ ^[0-9]+$ ]]; then
+        log WARN "Invalid dispatch_timeout_seconds '$t', using default 1800s"
+        t=1800
+    fi
+    echo "$t"
+}
+
+# Dispatch a skill to a fresh Claude process with timeout
+dispatch() {
+    local skill="$1"
+    local model="${2:-}"
+    local skill_timeout
+    skill_timeout=$(get_dispatch_timeout)
+
+    log INFO "Dispatching: $skill${model:+ (model: $model)}"
+    local start_time=$SECONDS
+
+    local model_args=()
+    [ -n "$model" ] && model_args=(--model "$model")
+
+    local dispatch_log="${LOG_DIR}/dispatch-$$.tmp"
+
+    timeout "$skill_timeout" claude -p "$skill" --dangerously-skip-permissions "${model_args[@]}" \
+        > "$dispatch_log" 2>&1
+    local exit_code=$?
+
+    # Append dispatch output to main log
+    if [ -n "$LOG_FILE" ] && [ -f "$dispatch_log" ]; then
+        {
+            echo ""
+            echo "=== Dispatch: $skill ==="
+            cat "$dispatch_log"
+            echo "=== End Dispatch ==="
+            echo ""
+        } >> "$LOG_FILE"
+    fi
+    rm -f "$dispatch_log"
+
+    local elapsed=$((SECONDS - start_time))
+
+    if [ "$exit_code" -eq 124 ]; then
+        log ERROR "Dispatch TIMED OUT after ${skill_timeout}s: $skill"
+        return 1
+    elif [ "$exit_code" -ne 0 ]; then
+        log ERROR "Dispatch FAILED (exit $exit_code, ${elapsed}s): $skill"
+        return 1
+    fi
+
+    log INFO "Dispatch OK (${elapsed}s): $skill"
+    return 0
+}
+
+# Crash-resilient arbiter invocation.
+# Dispatches /order-arbiter with retry on crash or empty verdict.
+# Prints verdict to stdout. Caller captures with: ARB=$(invoke_arbiter)
+# Returns 0 on success (verdict is valid), 1 on total failure (verdict is "HALT").
+invoke_arbiter() {
+    local max_retries arbiter_delay
+    max_retries=$(config "max_arbiter_retries" "2")
+    arbiter_delay=$(config "arbiter_retry_delay_seconds" "15")
+
+    local attempt=0
+    while [ "$attempt" -lt "$max_retries" ]; do
+        attempt=$((attempt + 1))
+        log INFO "Invoking arbiter (attempt $attempt/$max_retries)"
+
+        if dispatch "/order-arbiter"; then
+            local verdict
+            verdict=$(state '.last_result.verdict')
+
+            if [ -z "$verdict" ] || [ "$verdict" = "null" ]; then
+                log WARN "Arbiter returned empty verdict (attempt $attempt/$max_retries)"
+                if [ "$attempt" -lt "$max_retries" ]; then
+                    log INFO "Retrying arbiter in ${arbiter_delay}s..."
+                    sleep "$arbiter_delay"
+                    continue
+                fi
+                log ERROR "Arbiter returned empty verdict on all attempts. Defaulting to HALT."
+                echo "HALT"
+                return 1
+            fi
+
+            echo "$verdict"
+            return 0
+        fi
+
+        log ERROR "Arbiter dispatch crashed (attempt $attempt/$max_retries)"
+        if [ "$attempt" -lt "$max_retries" ]; then
+            log INFO "Retrying arbiter in ${arbiter_delay}s..."
+            sleep "$arbiter_delay"
+        fi
+    done
+
+    log ERROR "Arbiter failed after $max_retries attempts. Defaulting to HALT."
+    echo "HALT"
+    return 1
+}
+
+# Universal dispatch wrapper with retry + arbiter escalation.
+#
+# dispatch_or_recover SKILL SKIP_STATE [MODEL]
+#
+# Tries dispatch with retry, then escalates to arbiter if all retries fail.
+#   SKILL       - The skill to dispatch (e.g., "/parse-roadmap")
+#   SKIP_STATE  - State to advance to if arbiter says SKIP. Use "NONE" if
+#                 skipping is not meaningful for this skill.
+#   MODEL       - Optional model override
+#
+# Returns:
+#   0 = dispatch succeeded normally
+#   1 = arbiter said RETRY (caller should `continue` the main loop)
+#   2 = arbiter said SKIP (state already advanced to SKIP_STATE)
+#   3 = arbiter said HALT (caller should `exit 1`)
+dispatch_or_recover() {
+    local skill="$1"
+    local skip_state="$2"
+    local model="${3:-}"
+
+    local max_retries dispatch_delay
+    max_retries=$(config "max_dispatch_retries" "2")
+    dispatch_delay=$(config "dispatch_retry_delay_seconds" "30")
+
+    local attempt=0
+    while [ "$attempt" -lt "$max_retries" ]; do
+        attempt=$((attempt + 1))
+
+        if dispatch "$skill" "$model"; then
+            return 0
+        fi
+
+        log WARN "Dispatch failed: $skill (attempt $attempt/$max_retries)"
+        if [ "$attempt" -lt "$max_retries" ]; then
+            log INFO "Retrying in ${dispatch_delay}s..."
+            sleep "$dispatch_delay"
+        fi
+    done
+
+    log ERROR "Dispatch exhausted retries for: $skill. Escalating to arbiter."
+
+    # Set context for arbiter decision
+    jq --arg skill "$skill" --arg time "$(date -Iseconds)" \
+       '.last_result = {skill: $skill, verdict: "DISPATCH_FAILED", reason: "Exhausted retries"} | .last_transition = $time' \
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+
+    local arb_verdict
+    arb_verdict=$(invoke_arbiter)
+
+    case "$arb_verdict" in
+        RETRY)
+            log INFO "Arbiter: RETRY. Will re-enter state loop."
+            return 1
+            ;;
+        SKIP)
+            if [ -n "$skip_state" ] && [ "$skip_state" != "NONE" ]; then
+                log INFO "Arbiter: SKIP. Advancing to $skip_state."
+                jq --arg state "$skip_state" --arg time "$(date -Iseconds)" \
+                   '.current_state = $state | .last_transition = $time | del(.last_result)' \
+                   "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+                return 2
+            else
+                log WARN "Arbiter said SKIP but no skip state defined for $skill. Treating as HALT."
+                return 3
+            fi
+            ;;
+        *)
+            log ERROR "Arbiter: HALT (verdict: $arb_verdict)"
+            return 3
+            ;;
+    esac
+}
+
+# ══════════════════════════════════════════════════════════════════
+# SAFETY
+# ══════════════════════════════════════════════════════════════════
+
 preflight() {
     if [ -f "$KILL_FILE" ]; then
-        echo "x Kill file detected ($KILL_FILE). Halting."
+        log ERROR "Kill file detected ($KILL_FILE). Halting."
         exit 1
     fi
     if [ -f ".claude/scripts/sentinel-check.sh" ]; then
         if ! bash .claude/scripts/sentinel-check.sh 2>/dev/null; then
-            echo "x Sentinel check failed. Halting."
+            log ERROR "Sentinel check failed. Halting."
             exit 1
         fi
     fi
 }
 
+# ══════════════════════════════════════════════════════════════════
+# HISTORY & ARCHIVE MANAGEMENT
+# ══════════════════════════════════════════════════════════════════
+
+# Archive old transition_history entries to keep state.json minimal
+archive_transitions() {
+    local count
+    count=$(jq '.transition_history | length' "$STATE_FILE" 2>/dev/null || echo "0")
+    [ "$count" -le "$HISTORY_KEEP" ] && return 0
+
+    local archive_count=$((count - HISTORY_KEEP))
+
+    if ! jq -c ".transition_history[:$archive_count][]" "$STATE_FILE" >> "$HISTORY_ARCHIVE"; then
+        log WARN "Failed to append to $HISTORY_ARCHIVE, skipping archive."
+        return 1
+    fi
+
+    jq --argjson keep "$HISTORY_KEEP" \
+       '.transition_history = .transition_history[-$keep:]' \
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+
+    log INFO "Archived $archive_count transitions to $HISTORY_ARCHIVE"
+}
+
+# Archive merged PRs from previous steps to keep state.json lean.
+# Keeps only PRs from the current step (unmerged) and the last 10 merged.
+archive_merged_prs() {
+    local merged_count
+    merged_count=$(jq '[.prs // {} | to_entries[] | select(.value.status == "merged")] | length' "$STATE_FILE" 2>/dev/null || echo "0")
+
+    [ "$merged_count" -le 10 ] && return 0
+
+    local archive_count=$((merged_count - 10))
+    local archive_file="${HISTORY_ARCHIVE%.jsonl}-prs.jsonl"
+
+    # Append oldest merged PRs to archive
+    if ! jq -c "[.prs // {} | to_entries[] | select(.value.status == \"merged\")] | sort_by(.key | tonumber) | .[:$archive_count][]" \
+         "$STATE_FILE" >> "$archive_file" 2>/dev/null; then
+        log WARN "Failed to archive merged PRs."
+        return 1
+    fi
+
+    # Remove archived PRs from state (oldest N merged)
+    local keys_to_remove
+    keys_to_remove=$(jq -r "[.prs // {} | to_entries[] | select(.value.status == \"merged\")] | sort_by(.key | tonumber) | .[:$archive_count][] | .key" "$STATE_FILE" 2>/dev/null)
+
+    if [ -n "$keys_to_remove" ]; then
+        local jq_del=""
+        for key in $keys_to_remove; do
+            jq_del="$jq_del | del(.prs[\"$key\"])"
+        done
+        # Remove leading " | "
+        jq_del="${jq_del# | }"
+
+        jq "$jq_del" "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+        log INFO "Archived $archive_count merged PRs to $archive_file"
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+# CI CONTEXT ENRICHMENT
+# ══════════════════════════════════════════════════════════════════
+
 # Enrich state.json with CI failure context for the arbiter
-# Usage: enrich_ci_context <pr_number> <fix_attempt> <max_fix_attempts>
 enrich_ci_context() {
     local pr_num="$1" fix_attempt="$2" max_attempts="$3"
     local pr_branch
 
+    log INFO "Enriching CI context for PR #$pr_num (attempt $fix_attempt/$max_attempts)"
+
     pr_branch=$(gh pr view "$pr_num" --json headRefName -q '.headRefName' 2>/dev/null || echo "")
 
-    # Fetch failed check details from statusCheckRollup
     local failed_checks
     failed_checks=$(gh pr view "$pr_num" --json statusCheckRollup \
         -q '[.statusCheckRollup // [] | .[] | select(.status == "COMPLETED" and .conclusion == "FAILURE")] | map({name: .name, detail: .detailsUrl})' \
         2>/dev/null || echo "[]")
 
-    # Extract job_id and run_id from detailsUrl (format: .../runs/{run_id}/job/{job_id})
     local enriched_checks
     enriched_checks=$(echo "$failed_checks" | jq '[.[] | {
         name: .name,
@@ -103,9 +576,8 @@ enrich_ci_context() {
         run_id: (.detail | capture("runs/(?<id>[0-9]+)") | .id // empty)
     }]' 2>/dev/null || echo "[]")
 
-    # Warn if job ID extraction failed (arbiter will still run but may not fetch logs)
     if [ "$enriched_checks" = "[]" ] || [ -z "$enriched_checks" ]; then
-        echo "    x Warning: Failed to extract job IDs from failed checks for PR $pr_num"
+        log WARN "Failed to extract job IDs from failed checks for PR $pr_num"
     fi
 
     jq --arg pr "$pr_num" \
@@ -121,7 +593,7 @@ enrich_ci_context() {
             fix_attempt: $attempt,
             max_fix_attempts: $max
         }' \
-       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
 
     # Capture CI failure logs to sidecar file
     local log_file=".chaos/framework/order/ci-failure-${pr_num}.log"
@@ -150,87 +622,14 @@ enrich_ci_context() {
         done
     fi
 
-    echo "    CI failure context saved to $log_file"
+    log INFO "CI failure context saved to $log_file"
 }
 
-# Archive old transition_history entries to keep state.json minimal.
-# Keeps last HISTORY_KEEP entries in state.json, appends older to JSONL.
-archive_transitions() {
-    local count
-    count=$(jq '.transition_history | length' "$STATE_FILE" 2>/dev/null || echo "0")
-    [ "$count" -le "$HISTORY_KEEP" ] && return 0
+# ══════════════════════════════════════════════════════════════════
+# CONFLICT RESOLUTION
+# ══════════════════════════════════════════════════════════════════
 
-    local archive_count=$((count - HISTORY_KEEP))
-
-    # Append older entries to JSONL archive (one JSON object per line)
-    # Check append success before truncating to avoid data loss
-    if ! jq -c ".transition_history[:$archive_count][]" "$STATE_FILE" >> "$HISTORY_ARCHIVE"; then
-        echo "  x Warning: Failed to append to $HISTORY_ARCHIVE, skipping archive."
-        return 1
-    fi
-
-    # Keep only the last N entries in state.json
-    jq --argjson keep "$HISTORY_KEEP" \
-       '.transition_history = .transition_history[-$keep:]' \
-       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-
-    echo "  Archived $archive_count transitions to $HISTORY_ARCHIVE"
-}
-
-# Print essential state fields (avoids reading full state.json)
-state_summary() {
-    jq '{
-        current_state,
-        step_number,
-        last_transition,
-        last_result,
-        spec_id,
-        consecutive_failures,
-        completed_count: (.completed // [] | length),
-        failed_count: (.failed // [] | length),
-        open_prs: [.prs // {} | to_entries[] | select(.value.status != "merged") | .key],
-        history_len: (.transition_history | length)
-    }' "$STATE_FILE"
-}
-
-# Auto-fix lint and formatting before marking PR ready.
-# Runs on the PR branch. Commits and pushes if changes made.
-auto_fix_formatting() {
-    local pr_branch="$1"
-    local changed=false
-
-    # Frontend (web/)
-    if [ -d "web" ] && [ -f "web/package.json" ]; then
-        echo "    Running frontend lint:fix + prettier..."
-        (cd web && npx eslint . --fix 2>/dev/null || true)
-        (cd web && npx prettier --write "src/**/*.{ts,tsx,css}" 2>/dev/null || true)
-        if ! git diff --quiet -- web/ 2>/dev/null; then
-            git diff --name-only -- web/ | xargs -r git add
-            changed=true
-        fi
-    fi
-
-    # Go
-    if [ -f "go.mod" ]; then
-        echo "    Running go fmt..."
-        go fmt ./... 2>/dev/null || true
-        if ! git diff --quiet 2>/dev/null; then
-            git diff --name-only -- '*.go' 'go.mod' 'go.sum' | xargs -r git add
-            changed=true
-        fi
-    fi
-
-    if [ "$changed" = true ]; then
-        git commit -m "style: auto-fix lint and formatting" 2>/dev/null || true
-        git push origin "$pr_branch" 2>/dev/null || true
-        echo "    Auto-fix committed and pushed."
-    else
-        echo "    No formatting changes needed."
-    fi
-}
-
-# Attempt simple conflict resolution for add/add conflicts where one side
-# is a strict superset of the other (e.g., HEAD has extra struct tags).
+# Attempt simple conflict resolution for add/add superset conflicts.
 # Returns 0 if ALL conflicts in the current rebase step were resolved.
 try_simple_conflict_resolution() {
     local conflict_files
@@ -242,29 +641,28 @@ try_simple_conflict_resolution() {
     while IFS= read -r cfile; do
         [ -z "$cfile" ] && continue
 
-        # Only handle files with a single conflict block
         local block_count
         block_count=$(grep -c '^<<<<<<<' "$cfile" 2>/dev/null || echo "0")
         if [ "$block_count" -ne 1 ]; then
+            log DEBUG "Skipping $cfile: $block_count conflict blocks (only single-block supported)"
             all_resolved=false
             continue
         fi
 
-        # Extract ours (HEAD/main) and theirs (PR branch) content
         local ours theirs
         ours=$(sed -n '/^<<<<<<</,/^=======/p' "$cfile" 2>/dev/null | sed '1d;$d')
         theirs=$(sed -n '/^=======/,/^>>>>>>>/p' "$cfile" 2>/dev/null | sed '1d;$d')
 
-        # Check if one side is a strict superset of the other (all lines present)
         if diff <(echo "$theirs" | sort) <(echo "$ours" | grep -Fxf <(echo "$theirs") | sort) &>/dev/null; then
             git checkout --ours "$cfile" 2>/dev/null
             git add "$cfile"
-            echo "      Simple-resolved $cfile (HEAD superset)"
+            log INFO "Simple-resolved $cfile (HEAD superset)"
         elif diff <(echo "$ours" | sort) <(echo "$theirs" | grep -Fxf <(echo "$ours") | sort) &>/dev/null; then
             git checkout --theirs "$cfile" 2>/dev/null
             git add "$cfile"
-            echo "      Simple-resolved $cfile (PR superset)"
+            log INFO "Simple-resolved $cfile (PR superset)"
         else
+            log DEBUG "Cannot simple-resolve $cfile: not a superset conflict"
             all_resolved=false
         fi
     done <<< "$conflict_files"
@@ -272,117 +670,737 @@ try_simple_conflict_resolution() {
     [ "$all_resolved" = true ]
 }
 
-# ── Initialization ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# AUTO-FIX (delegated to project script)
+# ══════════════════════════════════════════════════════════════════
+
+auto_fix_formatting() {
+    local pr_branch="$1"
+
+    if [ -f ".claude/scripts/auto-fix.sh" ]; then
+        log INFO "Running project auto-fix script on $pr_branch"
+        bash .claude/scripts/auto-fix.sh "$pr_branch" 2>&1 | while IFS= read -r line; do
+            log DEBUG "auto-fix: $line"
+        done
+    else
+        log DEBUG "No auto-fix script found at .claude/scripts/auto-fix.sh"
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+# MERGE SUB-FUNCTIONS
+#
+# Each returns 0=success, 1=failure (caller should increment MERGE_FAILED).
+# On failure, the function calls add_blocker() with details.
+# All functions ensure we return to the main branch on exit.
+# ══════════════════════════════════════════════════════════════════
+
+# Phase 0: Rebase PR branch onto current main
+merge_rebase_pr() {
+    local pr_num="$1"
+
+    local pr_data pr_branch pr_state
+    pr_data=$(gh pr view "$pr_num" --json headRefName,state 2>/dev/null || echo '{}')
+    pr_branch=$(echo "$pr_data" | jq -r '.headRefName // empty')
+    pr_state=$(echo "$pr_data" | jq -r '.state // empty')
+
+    if [ -z "$pr_branch" ] || [ "$pr_state" != "OPEN" ]; then
+        log WARN "PR #$pr_num: not open or no branch found (state: $pr_state)"
+        add_blocker "PR #$pr_num: not open (state: $pr_state)"
+        return 1
+    fi
+
+    log INFO "Rebasing $pr_branch onto main"
+
+    # Try GitHub-side branch update first
+    if gh pr update-branch "$pr_num" 2>/dev/null; then
+        log INFO "Branch updated via GitHub API"
+        sleep 5
+        return 0
+    fi
+
+    # Fallback: local rebase + force-push
+    log INFO "GitHub API update failed, trying local rebase"
+    git fetch origin main 2>/dev/null || true
+    git checkout "$pr_branch" 2>/dev/null || {
+        log ERROR "Failed to checkout $pr_branch"
+        git checkout main 2>/dev/null || true
+        add_blocker "PR #$pr_num: branch checkout failed"
+        return 1
+    }
+    git pull origin "$pr_branch" 2>/dev/null || true
+
+    if git rebase origin/main 2>/dev/null; then
+        # Safety check: never force-push main/master or empty branch
+        if [[ "$pr_branch" == "main" ]] || [[ "$pr_branch" == "master" ]] || [[ -z "$pr_branch" ]]; then
+            log ERROR "Refusing to force-push protected branch: ${pr_branch:-<empty>}"
+            git rebase --abort 2>/dev/null || true
+            git checkout main 2>/dev/null || true
+            add_blocker "PR #$pr_num: invalid branch for force-push"
+            return 1
+        fi
+        log INFO "Rebase succeeded. Force-pushing."
+        if git push --force-with-lease origin "$pr_branch" 2>/dev/null; then
+            log INFO "Force-push succeeded"
+            git checkout main 2>/dev/null || true
+            return 0
+        else
+            log ERROR "Force-push failed"
+            git rebase --abort 2>/dev/null || true
+            git checkout main 2>/dev/null || true
+            add_blocker "PR #$pr_num: force-push failed after rebase"
+            update_pr_status "$pr_num" "rebase_failed"
+            return 1
+        fi
+    fi
+
+    # Rebase conflict — try simple resolution
+    log INFO "Rebase conflict for PR #$pr_num. Attempting simple resolution."
+    local rebase_done=false
+
+    if try_simple_conflict_resolution; then
+        log INFO "All conflicts resolved simply. Continuing rebase."
+        if GIT_EDITOR=true git rebase --continue 2>/dev/null; then
+            if [ ! -d ".git/rebase-merge" ] && [ ! -d ".git/rebase-apply" ]; then
+                log INFO "Rebase complete via simple resolution"
+                if git push --force-with-lease origin "$pr_branch" 2>/dev/null; then
+                    log INFO "Force-push succeeded"
+                    git checkout main 2>/dev/null || true
+                    return 0
+                else
+                    log ERROR "Force-push failed after simple resolution"
+                    git checkout main 2>/dev/null || true
+                    add_blocker "PR #$pr_num: force-push failed after simple resolution"
+                    update_pr_status "$pr_num" "rebase_failed"
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
+    # Complex conflicts — dispatch /resolve-conflicts
+    if [ ! -d ".git/rebase-merge" ] && [ ! -d ".git/rebase-apply" ]; then
+        log INFO "Restarting rebase for full conflict resolution"
+        git rebase --abort 2>/dev/null || true
+        git rebase origin/main 2>/dev/null || true
+    fi
+
+    log INFO "Complex conflicts remain. Dispatching /resolve-conflicts."
+
+    local conflict_files
+    conflict_files=$(git diff --name-only --diff-filter=U 2>/dev/null | jq -R . | jq -s .)
+
+    jq --arg pr "$pr_num" \
+       --arg branch "$pr_branch" \
+       --argjson files "${conflict_files:-[]}" \
+       '.conflict_context = {pr_number: $pr, branch: $branch, conflict_files: $files}' \
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+
+    if dispatch "/resolve-conflicts"; then
+        local resolve_verdict
+        resolve_verdict=$(state '.last_result.verdict')
+        if [ "$resolve_verdict" = "RESOLVED" ]; then
+            log INFO "Conflicts resolved for PR #$pr_num"
+            git checkout main 2>/dev/null || true
+            return 0
+        else
+            log ERROR "Resolution returned: $resolve_verdict"
+        fi
+    else
+        log ERROR "/resolve-conflicts crashed"
+    fi
+
+    git rebase --abort 2>/dev/null || true
+    git checkout main 2>/dev/null || true
+    add_blocker "PR #$pr_num: conflict unresolvable"
+    update_pr_status "$pr_num" "rebase_conflict"
+    return 1
+}
+
+# Phase 0.5: Auto-fix lint and formatting
+merge_auto_fix_pr() {
+    local pr_num="$1"
+
+    local pr_branch
+    pr_branch=$(gh pr view "$pr_num" --json headRefName -q '.headRefName' 2>/dev/null)
+
+    if [ -z "$pr_branch" ]; then
+        log WARN "PR #$pr_num: could not determine branch for auto-fix"
+        return 0  # non-fatal
+    fi
+
+    log INFO "Auto-fixing lint/formatting on $pr_branch"
+    git checkout "$pr_branch" 2>/dev/null || true
+    git pull origin "$pr_branch" 2>/dev/null || true
+    auto_fix_formatting "$pr_branch"
+    git checkout main 2>/dev/null || true
+    return 0
+}
+
+# Phase 1: Mark draft PR as ready for review
+merge_mark_ready() {
+    local pr_num="$1"
+
+    local is_draft
+    is_draft=$(gh pr view "$pr_num" --json isDraft -q '.isDraft' 2>/dev/null || echo "true")
+
+    if [ "$is_draft" = "true" ]; then
+        log INFO "Marking PR #$pr_num ready for review"
+        if ! gh pr ready "$pr_num" 2>/dev/null; then
+            log ERROR "Failed to mark PR #$pr_num ready"
+            add_blocker "PR #$pr_num: failed to mark ready for review"
+            update_pr_status "$pr_num" "ready_failed"
+            return 1
+        fi
+        update_pr_status "$pr_num" "ready"
+        log INFO "PR #$pr_num marked ready"
+    else
+        log DEBUG "PR #$pr_num already marked ready"
+    fi
+
+    return 0
+}
+
+# Phase 2+3: Poll checks, run arbiter fixes if needed, handle review feedback
+# This function handles the full check/fix/feedback cycle internally.
+merge_poll_and_fix() {
+    local pr_num="$1"
+
+    local gha_timeout max_feedback max_fix poll_interval
+    gha_timeout=$(config "gha_wait_timeout_minutes" "30")
+    max_feedback=$(config "max_feedback_rounds" "5")
+    max_fix=$(config "max_fix_attempts" "3")
+    poll_interval=120
+
+    local fix_attempt=0
+    local feedback_round=0
+
+    while [ "$feedback_round" -le "$max_feedback" ]; do
+
+        # ── Poll checks until completion ──
+        local deadline checks_resolved checks_passed failed_checks
+        deadline=$(($(date +%s) + gha_timeout * 60))
+        checks_resolved=false
+        checks_passed=false
+        failed_checks=0
+
+        log INFO "Polling checks (timeout: ${gha_timeout}m, feedback round: $feedback_round)"
+
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            preflight
+
+            local check_data total_checks completed_checks changes_requested
+            check_data=$(gh pr view "$pr_num" --json statusCheckRollup,reviews 2>/dev/null || echo '{}')
+            total_checks=$(echo "$check_data" | jq '[.statusCheckRollup // [] | .[]] | length')
+            completed_checks=$(echo "$check_data" | jq '[.statusCheckRollup // [] | .[] | select(.status == "COMPLETED")] | length')
+            failed_checks=$(echo "$check_data" | jq '[.statusCheckRollup // [] | .[] | select(.status == "COMPLETED" and .conclusion == "FAILURE")] | length')
+            changes_requested=$(echo "$check_data" | jq '[.reviews // [] | .[] | select(.state == "CHANGES_REQUESTED")] | length')
+
+            log DEBUG "Checks: $completed_checks/$total_checks resolved, $failed_checks failed, $changes_requested reviews requesting changes"
+
+            # Early exit: check failure
+            if [ "$failed_checks" -gt 0 ]; then
+                log WARN "PR #$pr_num: check(s) FAILED"
+                checks_resolved=true
+                break
+            fi
+
+            # Early exit: changes requested
+            if [ "$changes_requested" -gt 0 ]; then
+                log WARN "PR #$pr_num: CHANGES_REQUESTED by reviewer"
+                checks_resolved=true
+                break
+            fi
+
+            # All checks passed
+            if [ "$total_checks" -gt 0 ] && [ "$completed_checks" -eq "$total_checks" ]; then
+                log INFO "PR #$pr_num: all $total_checks checks passed"
+                checks_resolved=true
+                checks_passed=true
+                break
+            fi
+
+            sleep "$poll_interval"
+        done
+
+        # Timeout
+        if [ "$checks_resolved" = false ]; then
+            log ERROR "PR #$pr_num timed out waiting for checks (${gha_timeout}m)"
+            add_blocker "PR #$pr_num: checks timed out after ${gha_timeout}m"
+            update_pr_status "$pr_num" "timeout"
+            return 1
+        fi
+
+        # ── Checks passed — run review feedback cycle ──
+        if [ "$checks_passed" = true ]; then
+            if [ "$feedback_round" -lt "$max_feedback" ]; then
+                feedback_round=$((feedback_round + 1))
+
+                local pr_branch
+                pr_branch=$(gh pr view "$pr_num" --json headRefName -q '.headRefName' 2>/dev/null)
+
+                if [ -n "$pr_branch" ]; then
+                    git checkout "$pr_branch" 2>/dev/null || true
+                    git pull origin "$pr_branch" 2>/dev/null || true
+                    local old_head
+                    old_head=$(git rev-parse HEAD 2>/dev/null)
+
+                    log INFO "Running /review-feedback (round $feedback_round/$max_feedback)"
+                    update_pr_status "$pr_num" "feedback_round_$feedback_round"
+                    dispatch "/review-feedback" || true
+
+                    git pull origin "$pr_branch" 2>/dev/null || true
+                    local new_head
+                    new_head=$(git rev-parse HEAD 2>/dev/null)
+                    git checkout main 2>/dev/null || true
+
+                    # Non-blocking review items
+                    if [ -f ".chaos/todos/TODO-${pr_num}.md" ]; then
+                        log INFO "Non-blocking review items saved to .chaos/todos/TODO-${pr_num}.md"
+                    fi
+
+                    if [ "$new_head" = "$old_head" ] || [ -z "$pr_branch" ]; then
+                        log INFO "No changes from feedback. Ready to merge."
+                        return 0
+                    fi
+
+                    log INFO "Feedback pushed changes. Re-polling checks."
+                    sleep 10
+                    continue  # re-enter check polling loop
+                fi
+            fi
+
+            # Max feedback rounds reached or no branch
+            log INFO "Checks passed. Ready to merge."
+            return 0
+        fi
+
+        # ── Checks failed — try arbiter fix ──
+        if [ "$failed_checks" -gt 0 ] && [ "$fix_attempt" -lt "$max_fix" ]; then
+            fix_attempt=$((fix_attempt + 1))
+            log INFO "Arbiter fix attempt $fix_attempt/$max_fix for PR #$pr_num"
+
+            if merge_arbiter_fix_cycle "$pr_num" "$fix_attempt" "$max_fix"; then
+                log INFO "Arbiter fix pushed. Re-polling checks."
+                sleep 15
+                continue  # re-enter check polling loop
+            else
+                return 1  # arbiter_fix_cycle already set blocker
+            fi
+        fi
+
+        # Exhausted fix attempts or changes requested
+        if [ "$failed_checks" -gt 0 ]; then
+            log ERROR "Max fix attempts ($max_fix) exhausted for PR #$pr_num"
+            add_blocker "PR #$pr_num: checks failed after $max_fix fix attempts"
+            update_pr_status "$pr_num" "checks_failed"
+        else
+            add_blocker "PR #$pr_num: review requested changes"
+            update_pr_status "$pr_num" "changes_requested"
+        fi
+        return 1
+
+    done  # feedback_round loop
+
+    log INFO "Max feedback rounds ($max_feedback) reached. Proceeding to merge."
+    return 0
+}
+
+# Arbiter CI fix sub-cycle: checkout PR branch, run arbiter, review fix, push
+# Returns 0 if fix was pushed successfully, 1 otherwise.
+merge_arbiter_fix_cycle() {
+    local pr_num="$1" fix_attempt="$2" max_fix="$3"
+
+    enrich_ci_context "$pr_num" "$fix_attempt" "$max_fix"
+
+    local pr_branch
+    pr_branch=$(gh pr view "$pr_num" --json headRefName -q '.headRefName' 2>/dev/null)
+    git checkout "$pr_branch" 2>/dev/null || true
+    git pull origin "$pr_branch" 2>/dev/null || true
+
+    local pre_head
+    pre_head=$(git rev-parse HEAD 2>/dev/null)
+
+    if [ -z "$pre_head" ]; then
+        log ERROR "Failed to capture pre-arbiter HEAD"
+        git checkout main 2>/dev/null || true
+        add_blocker "PR #$pr_num: failed to capture safety anchor"
+        return 1
+    fi
+
+    # Dispatch arbiter with retry (CI fix mode — arbiter_context is set)
+    local arbiter_ok=false
+    local arb_attempt=0
+    local arb_max arb_delay
+    arb_max=$(config "max_arbiter_retries" "2")
+    arb_delay=$(config "arbiter_retry_delay_seconds" "15")
+
+    while [ "$arb_attempt" -lt "$arb_max" ]; do
+        arb_attempt=$((arb_attempt + 1))
+        log INFO "Dispatching CI-fix arbiter (attempt $arb_attempt/$arb_max)"
+
+        if dispatch "/order-arbiter"; then
+            local check_verdict
+            check_verdict=$(state '.last_result.verdict')
+            if [ -n "$check_verdict" ] && [ "$check_verdict" != "null" ]; then
+                arbiter_ok=true
+                break
+            fi
+            log WARN "Arbiter returned empty verdict (attempt $arb_attempt/$arb_max)"
+        else
+            log ERROR "Arbiter crashed (attempt $arb_attempt/$arb_max)"
+        fi
+
+        if [ "$arb_attempt" -lt "$arb_max" ]; then
+            git reset --hard "$pre_head" 2>/dev/null || true
+            log INFO "Retrying arbiter in ${arb_delay}s..."
+            sleep "$arb_delay"
+        fi
+    done
+
+    if [ "$arbiter_ok" = false ]; then
+        log ERROR "Arbiter failed after $arb_max attempts for PR #$pr_num. Reverting."
+        git reset --hard "$pre_head" 2>/dev/null || true
+        git checkout main 2>/dev/null || true
+        add_blocker "PR #$pr_num: arbiter crashed after $arb_max attempts"
+        return 1
+    fi
+
+    local arb_verdict
+    arb_verdict=$(state '.last_result.verdict')
+
+    case "$arb_verdict" in
+        FIXED)
+            log INFO "Arbiter: FIXED. Running review."
+            if ! dispatch "/arbiter-review"; then
+                log ERROR "/arbiter-review crashed. Reverting."
+                git reset --hard "$pre_head" 2>/dev/null || true
+                git checkout main 2>/dev/null || true
+                add_blocker "PR #$pr_num: arbiter-review crashed"
+                return 1
+            fi
+
+            local review_verdict
+            review_verdict=$(state '.last_result.review')
+
+            if [ "$review_verdict" = "APPROVED" ]; then
+                log INFO "Review: APPROVED. Pushing fix."
+                if git push origin "$pr_branch" 2>/dev/null; then
+                    git checkout main 2>/dev/null || true
+                    return 0
+                else
+                    log ERROR "Push failed. Reverting."
+                    git reset --hard "$pre_head" 2>/dev/null || true
+                    git checkout main 2>/dev/null || true
+                    add_blocker "PR #$pr_num: arbiter fix push failed"
+                    return 1
+                fi
+            else
+                local reason
+                reason=$(state '.last_result.review_reason // "no reason"')
+                log WARN "Review: REJECTED -- $reason. Reverting."
+                git reset --hard "$pre_head" 2>/dev/null || true
+                git checkout main 2>/dev/null || true
+                add_blocker "PR #$pr_num: arbiter fix rejected -- $reason"
+                return 1
+            fi
+            ;;
+        *)
+            log WARN "Arbiter: $arb_verdict. Reverting."
+            git reset --hard "$pre_head" 2>/dev/null || true
+            git checkout main 2>/dev/null || true
+            add_blocker "PR #$pr_num: arbiter verdict $arb_verdict"
+            return 1
+            ;;
+    esac
+}
+
+# Phase 4: Merge the PR
+merge_do_merge() {
+    local pr_num="$1"
+
+    local merge_method delete_branch
+    merge_method=$(config "merge_method" "squash")
+    delete_branch=$(config "delete_branch" "true")
+
+    update_pr_status "$pr_num" "checks_passed"
+    log INFO "Merging PR #$pr_num (method: $merge_method)"
+
+    local merge_flags="--$merge_method"
+    if [ "$delete_branch" = "true" ]; then
+        merge_flags="$merge_flags --delete-branch"
+    fi
+
+    # shellcheck disable=SC2086
+    if gh pr merge "$pr_num" $merge_flags 2>/dev/null; then
+        log INFO "PR #$pr_num merged successfully"
+        update_pr_status "$pr_num" "merged"
+        git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
+        return 0
+    fi
+
+    # gh pr merge can return non-zero even when the PR was merged
+    sleep 3
+    local actual_state
+    actual_state=$(gh pr view "$pr_num" --json state -q '.state' 2>/dev/null || echo "UNKNOWN")
+
+    if [ "$actual_state" = "MERGED" ]; then
+        log INFO "PR #$pr_num: merge command returned error but PR is MERGED. Continuing."
+        update_pr_status "$pr_num" "merged"
+        git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
+        return 0
+    fi
+
+    log ERROR "PR #$pr_num: merge command failed (state: $actual_state)"
+    add_blocker "PR #$pr_num: gh pr merge command failed"
+    update_pr_status "$pr_num" "merge_failed"
+    return 1
+}
+
+# Discover PRs from queue when state.json has none registered
+discover_prs() {
+    local queue_count
+    queue_count=$(count_queue_tasks)
+
+    if [ "$queue_count" -eq 0 ]; then
+        return 0
+    fi
+
+    log WARN "$queue_count tasks in queue but no PRs in state. Attempting discovery."
+    local discovered=0
+
+    while IFS='|' read -r disc_task_id disc_rest; do
+        [[ "$disc_task_id" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${disc_task_id}" ]] && continue
+        disc_task_id=$(echo "$disc_task_id" | xargs)
+        [[ -z "$disc_task_id" ]] && continue
+
+        local disc_bd_id disc_pr
+        disc_bd_id=$(echo "$disc_rest" | sed -n 's/.*bd:\([^|]*\).*/\1/p')
+        disc_pr=""
+
+        # Try beads-prefixed branch first
+        if [[ -n "$disc_bd_id" ]]; then
+            disc_pr=$(gh pr list --state open --head "task/${disc_bd_id}-${disc_task_id}" \
+                --json number -q '.[0].number' 2>/dev/null || echo "")
+        fi
+
+        # Fallback: exact branch match
+        if [[ -z "$disc_pr" ]]; then
+            disc_pr=$(gh pr list --state open --head "task/${disc_task_id}" \
+                --json number -q '.[0].number' 2>/dev/null || echo "")
+        fi
+
+        # Fallback: suffix match
+        if [[ -z "$disc_pr" ]]; then
+            disc_pr=$(gh pr list --state open --json number,headRefName \
+                --jq "[.[] | select(.headRefName | endswith(\"-${disc_task_id}\"))] | .[0].number // empty" \
+                2>/dev/null || echo "")
+        fi
+
+        if [[ -n "$disc_pr" ]]; then
+            log INFO "Discovered PR #$disc_pr for task $disc_task_id"
+            jq --arg pr "$disc_pr" --arg task "$disc_task_id" \
+                '.prs[$pr] = {"task": $task, "status": "draft"}' \
+                "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+            discovered=$((discovered + 1))
+        fi
+    done < "$QUEUE_FILE"
+
+    if [ "$discovered" -eq 0 ]; then
+        log ERROR "Could not discover any PRs for $queue_count queued tasks."
+        return 0  # return empty, caller handles
+    fi
+
+    log INFO "Discovered $discovered PRs."
+    # Return the newly discovered PR numbers
+    jq -r '.prs // {} | to_entries[] | select(.value.status == "merged" | not) | .key' "$STATE_FILE" 2>/dev/null
+}
+
+# Cleanup merge artifacts after MERGE_PRS completes
+cleanup_merge_artifacts() {
+    # Remove arbiter_context
+    if jq -e '.arbiter_context' "$STATE_FILE" >/dev/null 2>&1; then
+        jq 'del(.arbiter_context)' "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+        log DEBUG "Cleaned up arbiter_context"
+    fi
+
+    # Cleanup CI failure logs for merged PRs
+    for ci_log in .chaos/framework/order/ci-failure-*.log; do
+        [ -f "$ci_log" ] || continue
+        local log_pr
+        log_pr=$(basename "$ci_log" | sed 's/ci-failure-\([0-9]*\)\.log/\1/')
+        local log_status
+        log_status=$(jq -r ".prs[\"$log_pr\"].status // \"unknown\"" "$STATE_FILE" 2>/dev/null)
+        if [ "$log_status" = "merged" ]; then
+            rm -f "$ci_log"
+            log DEBUG "Cleaned up $ci_log"
+        fi
+    done
+}
+
+# ══════════════════════════════════════════════════════════════════
+# INITIALIZATION
+# ══════════════════════════════════════════════════════════════════
+
+init_logging
+log INFO "ORDER Lifecycle Orchestrator v3.0"
+log INFO "Max steps: $MAX_STEPS, Work model: $WORK_MODEL"
 
 if [ ! -f "$STATE_FILE" ]; then
-    echo '{"current_state":"INIT"}' > "$STATE_FILE"
+    if [ -f "${STATE_FILE}.bak" ]; then
+        log WARN "State file missing — recovering from backup."
+        cp "${STATE_FILE}.bak" "$STATE_FILE"
+        log INFO "Recovery successful. State: $(jq -c '{state: .current_state, step: .step_number}' "$STATE_FILE" 2>/dev/null)"
+    else
+        log INFO "No state file found. Creating initial state."
+        echo '{"current_state":"INIT","transition_history":[],"completed":[],"failed":[],"prs":{}}' > "$STATE_FILE"
+    fi
 fi
+rm -f "${STATE_FILE}.tmp"
 
 if [ -n "$START_STEP" ]; then
+    log INFO "Resuming from step $START_STEP"
     jq --arg step "$START_STEP" --arg time "$(date -Iseconds)" \
        '.current_state = "PARSE_ROADMAP" | .step_number = ($step | tonumber) | del(.last_result) | .last_transition = $time' \
-       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
 fi
 
-echo "=== ORDER Lifecycle Orchestrator ==="
-echo "Max steps: $MAX_STEPS"
-echo ""
+log_state_summary
+recover_dirty_state
 
-# ── Main State Machine Loop ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# MAIN STATE MACHINE LOOP
+# ══════════════════════════════════════════════════════════════════
 
 while true; do
     preflight
     archive_transitions
+    archive_merged_prs
 
     CURRENT=$(state '.current_state')
+    CURRENT_STEP=$(state '.step_number // "?"')
     VERDICT=$(state '.last_result.verdict')
 
-    echo "-- $CURRENT ${VERDICT:+(verdict: $VERDICT)} --"
+    log_separator "$CURRENT ${VERDICT:+(verdict: $VERDICT)}"
 
     case "$CURRENT" in
 
-        # ── INIT: Parse roadmap for next uncompleted step ──
+        # ── INIT: Parse roadmap for next uncompleted step ──────────
         INIT)
-            dispatch "/parse-roadmap" || exit 1
+            dispatch_or_recover "/parse-roadmap" "NONE"
+            dr_rc=$?
+            if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
+            if [ "$dr_rc" -eq 3 ]; then exit 1; fi
 
             VERDICT=$(state '.last_result.verdict')
             if [ "$VERDICT" = "ROADMAP_COMPLETE" ]; then
-                echo ""
-                echo "=== Roadmap Complete ==="
-                echo "All steps have been processed."
+                log INFO "=== Roadmap Complete ==="
+                log INFO "All steps have been processed."
                 exit 0
             fi
 
+            CURRENT_STEP=$(state '.step_number')
             step_count=$((step_count + 1))
             if [ "$step_count" -gt "$MAX_STEPS" ]; then
-                echo "Max steps ($MAX_STEPS) reached."
+                log INFO "Max steps ($MAX_STEPS) reached."
                 exit 0
             fi
             revision_count=0
-            echo "  Step $(state '.step_number') identified."
+
+            # Start a step-specific log file
+            step_title=$(state '.last_result.title')
+            start_step_log "$CURRENT_STEP" "$step_title"
+            log INFO "Step $CURRENT_STEP identified: $step_title"
+            log_state_summary
             ;;
 
-        # ── PARSE_ROADMAP: Create spec for this step ──
+        # ── PARSE_ROADMAP: Create spec for this step ──────────────
         PARSE_ROADMAP)
             STEP=$(state '.step_number')
 
-            # If parse-roadmap reported SPEC_EXISTS, skip to REVIEW_SPEC
             if [ "$VERDICT" = "SPEC_EXISTS" ]; then
-                echo "  Step $STEP already has a spec. Advancing to REVIEW_SPEC."
-                SPEC_ID=$(state '.spec_id')
+                log INFO "Step $STEP already has a spec. Advancing to REVIEW_SPEC."
                 jq --arg time "$(date -Iseconds)" \
                    '.current_state = "CREATE_SPEC" | .last_transition = $time | .last_result.verdict = "SPEC_CREATED"' \
-                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                   "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                 continue
             fi
 
-            dispatch "/create-spec $STEP" || exit 1
+            dispatch_or_recover "/create-spec $STEP" "INIT"
+            dr_rc=$?
+            if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
+            if [ "$dr_rc" -eq 3 ]; then exit 1; fi
+            log INFO "Spec created: $(state '.spec_id')"
+            log_state_summary
             ;;
 
-        # ── CREATE_SPEC: Review spec, or re-create if revision needed ──
+        # ── CREATE_SPEC: Review spec, or re-create if revision needed
         CREATE_SPEC)
             if [ "$VERDICT" = "NEEDS_REVISION" ]; then
                 revision_count=$((revision_count + 1))
                 MAX_REV=$(config "max_spec_revisions" "3")
 
                 if [ "$revision_count" -gt "$MAX_REV" ]; then
-                    echo "  x Max revisions ($MAX_REV) exceeded. Invoking arbiter..."
-                    dispatch "/order-arbiter" || exit 1
-                    ARB=$(state '.last_result.verdict')
-                    if [ "$ARB" = "SKIP" ]; then
-                        echo "  Arbiter: SKIP. Advancing to next step."
-                        jq '.current_state = "INIT" | del(.last_result)' \
-                            "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                        continue
-                    fi
-                    echo "  x Arbiter: HALT"; exit 1
+                    log WARN "Max revisions ($MAX_REV) exceeded. Invoking arbiter."
+                    ARB=$(invoke_arbiter)
+                    case "$ARB" in
+                        SKIP)
+                            log INFO "Arbiter: SKIP. Advancing to next step."
+                            jq '.current_state = "INIT" | del(.last_result)' \
+                                "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+                            continue
+                            ;;
+                        RETRY)
+                            log INFO "Arbiter: RETRY. Resetting revision count."
+                            revision_count=0
+                            continue
+                            ;;
+                        *)
+                            log ERROR "Arbiter: HALT (verdict: $ARB)"
+                            exit 1
+                            ;;
+                    esac
                 fi
 
-                echo "  Revision $revision_count/$MAX_REV -- re-creating spec..."
+                log INFO "Revision $revision_count/$MAX_REV -- re-creating spec"
                 STEP=$(state '.step_number')
-                dispatch "/create-spec $STEP" || exit 1
+                dispatch_or_recover "/create-spec $STEP" "INIT"
+                dr_rc=$?
+                if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
+                if [ "$dr_rc" -eq 3 ]; then exit 1; fi
             else
                 SPEC_ID=$(state '.spec_id')
-                dispatch "/review-spec specs/$SPEC_ID/SPEC.md" || exit 1
+                log INFO "Reviewing spec: specs/$SPEC_ID/SPEC.md"
+                dispatch_or_recover "/review-spec specs/$SPEC_ID/SPEC.md" "REVIEW_SPEC"
+                dr_rc=$?
+                if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
+                if [ "$dr_rc" -eq 3 ]; then exit 1; fi
 
                 NEW_VERDICT=$(state '.last_result.verdict')
+                log INFO "Review verdict: $NEW_VERDICT"
                 if [ "$NEW_VERDICT" = "READY" ]; then
                     revision_count=0
                 fi
             fi
+            log_state_summary
             ;;
 
-        # ── REVIEW_SPEC: Plan work from approved spec ──
+        # ── REVIEW_SPEC: Plan work from approved spec ─────────────
         REVIEW_SPEC)
             SPEC_ID=$(state '.spec_id')
-            dispatch "/plan-work specs/$SPEC_ID/SPEC.md" || exit 1
+            log INFO "Planning work for specs/$SPEC_ID/SPEC.md"
+            dispatch_or_recover "/plan-work specs/$SPEC_ID/SPEC.md" "INIT"
+            dr_rc=$?
+            if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
+            if [ "$dr_rc" -eq 3 ]; then exit 1; fi
+            log INFO "Tasks created: $(state '.last_result.task_count')"
+            log_state_summary
             ;;
 
-        # ── PLAN_WORK: Execute next single task from queue ──
-        # Sequential mode: one task at a time. Each task is worked, its PR
-        # merged, and main pulled before the next task begins.
+        # ── PLAN_WORK: Execute next single task from queue ────────
         PLAN_WORK)
-            # Find the next unprocessed task in queue
+            # Find next unprocessed task
             NEXT_TASK=""
             TOTAL_TASKS=0
             while IFS='|' read -r task_id rest; do
@@ -392,7 +1410,6 @@ while true; do
                 [[ -z "$task_id" ]] && continue
                 TOTAL_TASKS=$((TOTAL_TASKS + 1))
 
-                # Skip tasks already completed or failed
                 if jq -e --arg t "$task_id" '.completed // [] | index($t) != null' "$STATE_FILE" >/dev/null 2>&1; then
                     continue
                 fi
@@ -408,8 +1425,7 @@ while true; do
             FAILED_COUNT=$(jq '.failed // [] | length' "$STATE_FILE")
 
             if [ -z "$NEXT_TASK" ]; then
-                # All tasks have been processed (completed or failed)
-                echo "  All $TOTAL_TASKS tasks processed ($COMPLETED_COUNT ok, $FAILED_COUNT failed)."
+                log INFO "All $TOTAL_TASKS tasks processed ($COMPLETED_COUNT ok, $FAILED_COUNT failed)."
 
                 if [ "$FAILED_COUNT" -gt 0 ]; then
                     TASK_VERDICT="TASKS_FAILED"
@@ -417,44 +1433,69 @@ while true; do
                     TASK_VERDICT="TASKS_COMPLETE"
                 fi
 
-                # Skip EXECUTE_TASKS — go directly to MERGE_PRS for any remaining unmerged PRs
                 jq --arg state "MERGE_PRS" \
                    --arg time "$(date -Iseconds)" \
                    --arg verdict "$TASK_VERDICT" \
                    --argjson failures "$FAILED_COUNT" \
                    '.current_state = $state | .last_transition = $time | .last_result = {skill: "order-run-loop", verdict: $verdict, failures: $failures}' \
-                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                   "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
             else
-                echo "  [$((COMPLETED_COUNT + FAILED_COUNT + 1))/$TOTAL_TASKS] /work $NEXT_TASK"
+                log INFO "[$((COMPLETED_COUNT + FAILED_COUNT + 1))/$TOTAL_TASKS] Working task: $NEXT_TASK"
 
                 run_dir=".chaos/framework/runs/$NEXT_TASK"
                 mkdir -p "$run_dir"
 
-                # Pre-task: create branch from latest main
+                # Checkout main, create task branch
                 git checkout main 2>/dev/null || true
                 git pull origin main 2>/dev/null || true
                 git checkout -b "task/$NEXT_TASK" 2>/dev/null || git checkout "task/$NEXT_TASK" 2>/dev/null || true
 
-                claude -p "/work $NEXT_TASK" \
+                log INFO "Dispatching /work $NEXT_TASK (model: $WORK_MODEL)"
+                work_start=$SECONDS
+                skill_timeout=$(get_dispatch_timeout)
+
+                timeout "$skill_timeout" claude -p "/work $NEXT_TASK" \
                     --dangerously-skip-permissions \
                     --model "$WORK_MODEL" \
                     > "$run_dir/output.log" 2>&1
                 TASK_EXIT=$?
 
-                # Post-task hook captures PR number and updates state
+                work_elapsed=$((SECONDS - work_start))
+
+                # Append tail of work output to main log
+                if [ -n "$LOG_FILE" ] && [ -f "$run_dir/output.log" ]; then
+                    {
+                        echo ""
+                        echo "=== /work $NEXT_TASK (exit: $TASK_EXIT, ${work_elapsed}s) ==="
+                        tail -80 "$run_dir/output.log"
+                        echo "=== End /work (full log: $run_dir/output.log) ==="
+                        echo ""
+                    } >> "$LOG_FILE"
+                fi
+
+                if [ "$TASK_EXIT" -eq 124 ]; then
+                    log ERROR "/work $NEXT_TASK TIMED OUT after ${skill_timeout}s"
+                elif [ "$TASK_EXIT" -ne 0 ]; then
+                    log ERROR "/work $NEXT_TASK FAILED (exit $TASK_EXIT, ${work_elapsed}s)"
+                else
+                    log INFO "/work $NEXT_TASK completed (${work_elapsed}s)"
+                fi
+
+                # Post-task hook
                 if [ -f ".claude/scripts/post-task-hook.sh" ]; then
+                    log DEBUG "Running post-task hook for $NEXT_TASK"
                     bash .claude/scripts/post-task-hook.sh "$NEXT_TASK" "$TASK_EXIT" 2>/dev/null || true
                 fi
 
-                # Post-task: return to main regardless of outcome
+                # Return to main
                 git checkout main 2>/dev/null || true
 
-                # Check result from post-task hook
+                # Check result
                 if jq -e --arg t "$NEXT_TASK" '.completed // [] | index($t) != null' "$STATE_FILE" >/dev/null 2>&1; then
-                    echo "    ok: $NEXT_TASK"
+                    log INFO "Task $NEXT_TASK: OK"
                     TASK_VERDICT="TASKS_COMPLETE"
                 else
-                    echo "    x FAILED: $NEXT_TASK"
+                    log ERROR "Task $NEXT_TASK: FAILED"
                     TASK_VERDICT="TASKS_FAILED"
                 fi
 
@@ -463,138 +1504,78 @@ while true; do
                    --arg verdict "$TASK_VERDICT" \
                    --arg task "$NEXT_TASK" \
                    '.current_state = $state | .last_transition = $time | .last_result = {skill: "order-run-loop", verdict: $verdict, current_task: $task}' \
-                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                   "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
             fi
+            log_state_summary
             ;;
 
-        # ── EXECUTE_TASKS: Handle task result, then transition ──
+        # ── EXECUTE_TASKS: Handle task result, then transition ────
         EXECUTE_TASKS)
             if [ "$VERDICT" = "TASKS_FAILED" ]; then
-                echo "  Task failed. Invoking arbiter..."
-                dispatch "/order-arbiter" || exit 1
-                ARB=$(state '.last_result.verdict')
+                log WARN "Task failed. Invoking arbiter."
+                ARB=$(invoke_arbiter)
+
                 case "$ARB" in
                     RETRY)
-                        echo "  Arbiter: RETRY task."
-                        # Remove the task from failed list so PLAN_WORK retries it
+                        log INFO "Arbiter: RETRY task."
                         FAILED_TASK=$(state '.last_result.current_task // empty')
                         if [ -n "$FAILED_TASK" ]; then
                             jq --arg t "$FAILED_TASK" --arg time "$(date -Iseconds)" \
                                '.failed = [.failed // [] | .[] | select(. != $t)] | .consecutive_failures = 0 | .current_state = "PLAN_WORK" | .last_transition = $time | del(.last_result)' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                               "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                         else
                             jq --arg time "$(date -Iseconds)" \
                                '.current_state = "PLAN_WORK" | .last_transition = $time | del(.last_result)' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                               "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                         fi
                         continue
                         ;;
                     SKIP)
-                        echo "  Arbiter: SKIP failed task. Moving to next."
-                        # Task stays in failed list; PLAN_WORK will skip it
-                        # Check if there are remaining tasks or if we should wrap up
-                        REMAINING=$(jq '[.completed // [], .failed // []] | flatten | length' "$STATE_FILE")
-                        TOTAL_Q=$(grep -cvE '^[[:space:]]*(#|$)' "$QUEUE_FILE" 2>/dev/null || echo "0")
-                        if [ "$REMAINING" -ge "$TOTAL_Q" ]; then
-                            echo "  No more tasks. Advancing to merge available PRs."
+                        log INFO "Arbiter: SKIP failed task. Moving to next."
+                        REMAINING_PROCESSED=$(jq '[.completed // [], .failed // []] | flatten | length' "$STATE_FILE")
+                        TOTAL_Q=$(count_queue_tasks)
+                        if [ "$REMAINING_PROCESSED" -ge "$TOTAL_Q" ]; then
+                            log INFO "No more tasks. Advancing to merge available PRs."
                             jq --arg time "$(date -Iseconds)" \
                                '.current_state = "MERGE_PRS" | .last_transition = $time | del(.last_result)' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                               "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                         else
                             jq --arg time "$(date -Iseconds)" \
                                '.current_state = "PLAN_WORK" | .last_transition = $time | del(.last_result)' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                               "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                         fi
                         continue
                         ;;
                     *)
-                        echo "  x Arbiter: HALT."
+                        log ERROR "Arbiter: HALT (verdict: $ARB)"
                         exit 1
                         ;;
                 esac
             fi
 
-            # Task succeeded — transition to MERGE_PRS for this single PR
+            # Task succeeded — transition to MERGE_PRS
+            log INFO "Task succeeded. Transitioning to MERGE_PRS."
             jq --arg time "$(date -Iseconds)" \
                '.current_state = "MERGE_PRS" | .last_transition = $time | del(.last_result)' \
-               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+               "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
             ;;
 
-        # ── MERGE_PRS: Mark drafts ready, wait for GHA checks, address feedback, merge ──
+        # ── MERGE_PRS: Rebase, fix, poll, merge ──────────────────
         MERGE_PRS)
-            # Read config values
-            GHA_TIMEOUT=$(config "gha_wait_timeout_minutes" "30")
-            MERGE_METHOD=$(config "merge_method" "squash")
-            DELETE_BRANCH=$(config "delete_branch" "true")
-            MAX_FEEDBACK_ROUNDS=$(config "max_feedback_rounds" "5")
-            POLL_INTERVAL=120  # 2 minutes
+            log_separator "MERGE_PRS"
 
-            # Ensure TODO directory exists for review artifacts
             mkdir -p .chaos/todos
 
-            # Collect PR numbers from state.json (exclude already-merged PRs)
-            PR_NUMBERS=$(jq -r '.prs // {} | to_entries[] | select(.value.status != "merged") | .key' "$STATE_FILE" 2>/dev/null)
+            # Collect unmerged PRs
+            PR_NUMBERS=$(jq -r '.prs // {} | to_entries[] | select(.value.status == "merged" | not) | .key' "$STATE_FILE" 2>/dev/null)
 
             if [ -z "$PR_NUMBERS" ]; then
-                # Count queue tasks to detect PR registration failures
-                QUEUE_TASK_COUNT=$(grep -cvE '^[[:space:]]*(#|$)' "$QUEUE_FILE" 2>/dev/null || echo "0")
-
-                if [ "$QUEUE_TASK_COUNT" -gt 0 ]; then
-                    echo "  x WARNING: $QUEUE_TASK_COUNT tasks in queue but no PRs in state."
-                    echo "  Attempting PR discovery from queue..."
-
-                    DISCOVERED=0
-                    while IFS='|' read -r disc_task_id disc_rest; do
-                        [[ "$disc_task_id" =~ ^[[:space:]]*# ]] && continue
-                        [[ -z "${disc_task_id}" ]] && continue
-                        disc_task_id=$(echo "$disc_task_id" | xargs)
-                        [[ -z "$disc_task_id" ]] && continue
-
-                        disc_bd_id=$(echo "$disc_rest" | sed -n 's/.*bd:\([^|]*\).*/\1/p')
-                        disc_pr=""
-
-                        # Try beads-prefixed branch first
-                        if [[ -n "$disc_bd_id" ]]; then
-                            disc_pr=$(gh pr list --state open --head "task/${disc_bd_id}-${disc_task_id}" \
-                                --json number -q '.[0].number' 2>/dev/null || echo "")
-                        fi
-
-                        # Fallback: exact branch match
-                        if [[ -z "$disc_pr" ]]; then
-                            disc_pr=$(gh pr list --state open --head "task/${disc_task_id}" \
-                                --json number -q '.[0].number' 2>/dev/null || echo "")
-                        fi
-
-                        # Fallback: suffix match
-                        if [[ -z "$disc_pr" ]]; then
-                            disc_pr=$(gh pr list --state open --json number,headRefName \
-                                --jq "[.[] | select(.headRefName | endswith(\"-${disc_task_id}\"))] | .[0].number // empty" \
-                                2>/dev/null || echo "")
-                        fi
-
-                        if [[ -n "$disc_pr" ]]; then
-                            echo "    Discovered PR #$disc_pr for task $disc_task_id"
-                            jq --arg pr "$disc_pr" --arg task "$disc_task_id" \
-                                '.prs[$pr] = {"task": $task, "status": "draft"}' \
-                                "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                            DISCOVERED=$((DISCOVERED + 1))
-                        fi
-                    done < "$QUEUE_FILE"
-
-                    # Re-read after discovery
-                    PR_NUMBERS=$(jq -r '.prs // {} | to_entries[] | select(.value.status != "merged") | .key' "$STATE_FILE" 2>/dev/null)
-
-                    if [ -z "$PR_NUMBERS" ]; then
-                        echo "  x ERROR: Could not discover any PRs for $QUEUE_TASK_COUNT queued tasks."
-                        echo "  x Tasks may have failed to push branches. Halting."
-                        exit 1
-                    fi
-                    echo "  Discovered $DISCOVERED PRs. Proceeding to merge."
-                else
-                    echo "  No PRs to merge. Advancing to VERIFY_COMPLETION."
+                PR_NUMBERS=$(discover_prs)
+                if [ -z "$PR_NUMBERS" ]; then
+                    log INFO "No PRs to merge. Advancing to VERIFY_COMPLETION."
                     jq --arg time "$(date -Iseconds)" \
                        '.current_state = "VERIFY_COMPLETION" | .last_transition = $time' \
-                       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                     continue
                 fi
             fi
@@ -606,552 +1587,134 @@ while true; do
             for PR_NUM in $PR_NUMBERS; do
                 preflight
 
-                PR_STATUS=$(jq -r ".prs[\"$PR_NUM\"].status // \"draft\"" "$STATE_FILE")
-
-                # Skip already-merged PRs (idempotent for retries)
-                if [ "$PR_STATUS" = "merged" ]; then
-                    echo "  PR #$PR_NUM: already merged, skipping."
+                pr_status=$(jq -r ".prs[\"$PR_NUM\"].status // \"draft\"" "$STATE_FILE")
+                if [ "$pr_status" = "merged" ]; then
+                    log INFO "PR #$PR_NUM: already merged, skipping"
                     MERGE_SUCCEEDED=$((MERGE_SUCCEEDED + 1))
                     continue
                 fi
 
-                echo "  PR #$PR_NUM: processing..."
-                # Fix attempt counter (not persisted — resets if loop crashes and restarts)
-                FIX_ATTEMPT=0
-                MAX_FIX_ATTEMPTS=$(config "max_fix_attempts" "3")
+                log_separator "PR #$PR_NUM"
 
-                # ── Phase 0: Rebase PR branch onto current main ──
-                PR_DATA=$(gh pr view "$PR_NUM" --json headRefName,state 2>/dev/null || echo '{}')
-                PR_BRANCH=$(echo "$PR_DATA" | jq -r '.headRefName // empty')
-                PR_STATE=$(echo "$PR_DATA" | jq -r '.state // empty')
+                # Phase 0: Rebase
+                merge_rebase_pr "$PR_NUM" || { MERGE_FAILED=$((MERGE_FAILED + 1)); continue; }
+                sleep 10
 
-                if [ -n "$PR_BRANCH" ] && [ "$PR_STATE" = "OPEN" ]; then
-                    echo "    Rebasing $PR_BRANCH onto main..."
+                # Phase 0.5: Auto-fix
+                merge_auto_fix_pr "$PR_NUM"
+                sleep 5
 
-                    # Try GitHub-side branch update first (merge commit vanishes on squash merge)
-                    if gh pr update-branch "$PR_NUM" 2>/dev/null; then
-                        echo "    Branch updated via GitHub API."
-                        sleep 5
-                    else
-                        # Fallback: local rebase + force-push
-                        echo "    GitHub API update failed, trying local rebase..."
-                        git fetch origin main 2>/dev/null || true
-                        git checkout "$PR_BRANCH" 2>/dev/null || {
-                            echo "    x Failed to checkout $PR_BRANCH"
-                            git checkout main 2>/dev/null || true
-                            MERGE_FAILED=$((MERGE_FAILED + 1))
-                            MERGE_BLOCKERS+=("PR #$PR_NUM: branch checkout failed")
-                            continue
-                        }
-                        git pull origin "$PR_BRANCH" 2>/dev/null || true
+                # Phase 1: Mark ready
+                merge_mark_ready "$PR_NUM" || { MERGE_FAILED=$((MERGE_FAILED + 1)); continue; }
+                sleep 10
 
-                        if git rebase origin/main 2>/dev/null; then
-                            echo "    Rebase succeeded. Force-pushing..."
-                            if git push --force-with-lease origin "$PR_BRANCH" 2>/dev/null; then
-                                echo "    Force-push succeeded."
-                            else
-                                echo "    x Force-push failed for PR #$PR_NUM."
-                                git rebase --abort 2>/dev/null || true
-                                git checkout main 2>/dev/null || true
-                                MERGE_FAILED=$((MERGE_FAILED + 1))
-                                MERGE_BLOCKERS+=("PR #$PR_NUM: force-push failed after rebase")
-                                jq --arg pr "$PR_NUM" \
-                                   '.prs[$pr].status = "rebase_failed"' \
-                                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                                continue
-                            fi
-                        else
-                            echo "    Rebase conflict for PR #$PR_NUM. Attempting simple resolution..."
-                            REBASE_DONE=false
+                # Phase 2+3: Poll checks, fix, feedback
+                merge_poll_and_fix "$PR_NUM" || { MERGE_FAILED=$((MERGE_FAILED + 1)); continue; }
 
-                            # Try simple resolution first (handles add/add superset conflicts)
-                            if try_simple_conflict_resolution; then
-                                echo "    All conflicts resolved simply. Continuing rebase..."
-                                if GIT_EDITOR=true git rebase --continue 2>/dev/null; then
-                                    if [ ! -d ".git/rebase-merge" ] && [ ! -d ".git/rebase-apply" ]; then
-                                        echo "    Rebase complete via simple resolution."
-                                        if git push --force-with-lease origin "$PR_BRANCH" 2>/dev/null; then
-                                            echo "    Force-push succeeded."
-                                            REBASE_DONE=true
-                                        else
-                                            echo "    x Force-push failed after simple resolution."
-                                            git checkout main 2>/dev/null || true
-                                            MERGE_FAILED=$((MERGE_FAILED + 1))
-                                            MERGE_BLOCKERS+=("PR #$PR_NUM: force-push failed after simple resolution")
-                                            jq --arg pr "$PR_NUM" \
-                                               '.prs[$pr].status = "rebase_failed"' \
-                                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                                            continue
-                                        fi
-                                    fi
-                                fi
-                            fi
+                # Phase 4: Merge
+                merge_do_merge "$PR_NUM" || { MERGE_FAILED=$((MERGE_FAILED + 1)); continue; }
 
-                            # Fall through to /resolve-conflicts for complex conflicts
-                            if [ "$REBASE_DONE" = false ]; then
-                                if [ ! -d ".git/rebase-merge" ] && [ ! -d ".git/rebase-apply" ]; then
-                                    # Simple resolution partially worked but rebase finished with errors — restart
-                                    echo "    Restarting rebase for full conflict resolution..."
-                                    git rebase --abort 2>/dev/null || true
-                                    git rebase origin/main 2>/dev/null || true
-                                fi
-
-                                echo "    Complex conflicts remain. Dispatching /resolve-conflicts..."
-
-                                # Capture conflict files while rebase is in progress
-                                CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null \
-                                    | jq -R . | jq -s .)
-
-                                # Write conflict context to state.json for the skill
-                                jq --arg pr "$PR_NUM" \
-                                   --arg branch "$PR_BRANCH" \
-                                   --argjson files "${CONFLICT_FILES:-[]}" \
-                                   '.conflict_context = {pr_number: $pr, branch: $branch, conflict_files: $files}' \
-                                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-
-                                # Dispatch — rebase-in-progress state persists on disk
-                                if dispatch "/resolve-conflicts"; then
-                                    RESOLVE_VERDICT=$(state '.last_result.verdict')
-                                    if [ "$RESOLVE_VERDICT" = "RESOLVED" ]; then
-                                        echo "    Conflicts resolved for PR #$PR_NUM."
-                                        git checkout main 2>/dev/null || true
-                                        # Continue to Phase 1 (mark ready, poll, merge)
-                                    else
-                                        echo "    x Resolution returned: $RESOLVE_VERDICT"
-                                        git rebase --abort 2>/dev/null || true
-                                        git checkout main 2>/dev/null || true
-                                        MERGE_FAILED=$((MERGE_FAILED + 1))
-                                        MERGE_BLOCKERS+=("PR #$PR_NUM: conflict unresolvable")
-                                        jq --arg pr "$PR_NUM" \
-                                           '.prs[$pr].status = "rebase_conflict"' \
-                                           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                                        continue
-                                    fi
-                                else
-                                    echo "    x /resolve-conflicts crashed for PR #$PR_NUM."
-                                    git rebase --abort 2>/dev/null || true
-                                    git checkout main 2>/dev/null || true
-                                    MERGE_FAILED=$((MERGE_FAILED + 1))
-                                    MERGE_BLOCKERS+=("PR #$PR_NUM: resolve-conflicts crashed")
-                                    jq --arg pr "$PR_NUM" \
-                                       '.prs[$pr].status = "rebase_conflict"' \
-                                       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                                    continue
-                                fi
-                            fi
-                        fi
-
-                        # Return to main after local rebase
-                        git checkout main 2>/dev/null || true
-                    fi
-
-                    # Brief pause for GHA to trigger on synchronize event from rebase
-                    sleep 10
-                fi
-
-                # ── Phase 0.5: Auto-fix lint and formatting ──
-                if [ -n "$PR_BRANCH" ] && [ "$PR_STATE" = "OPEN" ]; then
-                    echo "    Auto-fixing lint/formatting on $PR_BRANCH..."
-                    git checkout "$PR_BRANCH" 2>/dev/null || true
-                    git pull origin "$PR_BRANCH" 2>/dev/null || true
-                    auto_fix_formatting "$PR_BRANCH"
-                    git checkout main 2>/dev/null || true
-                    sleep 5
-                fi
-
-                # ── Phase 1: Mark draft as ready for review ──
-                IS_DRAFT=$(gh pr view "$PR_NUM" --json isDraft -q '.isDraft' 2>/dev/null || echo "true")
-                if [ "$IS_DRAFT" = "true" ]; then
-                    echo "    Marking ready for review..."
-                    if ! gh pr ready "$PR_NUM" 2>/dev/null; then
-                        echo "    x Failed to mark PR #$PR_NUM ready."
-                        MERGE_FAILED=$((MERGE_FAILED + 1))
-                        MERGE_BLOCKERS+=("PR #$PR_NUM: failed to mark ready for review")
-                        jq --arg pr "$PR_NUM" \
-                           '.prs[$pr].status = "ready_failed"' \
-                           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                        continue
-                    fi
-                    jq --arg pr "$PR_NUM" \
-                       '.prs[$pr].status = "ready"' \
-                       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                    echo "    PR #$PR_NUM marked ready."
-                    # Brief pause for GHA to trigger on ready_for_review event
-                    sleep 10
-                fi
-
-                FEEDBACK_ROUND=0
-                PR_MERGEABLE=false
-
-                while [ "$FEEDBACK_ROUND" -le "$MAX_FEEDBACK_ROUNDS" ]; do
-
-                    # ── Phase 2: Poll GHA checks until completion ──
-                    DEADLINE=$(($(date +%s) + GHA_TIMEOUT * 60))
-                    CHECKS_RESOLVED=false
-                    CHECKS_PASSED=false
-
-                    echo "    Polling checks (timeout: ${GHA_TIMEOUT}m, round: $FEEDBACK_ROUND)..."
-
-                    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-                        preflight
-
-                        CHECK_DATA=$(gh pr view "$PR_NUM" --json statusCheckRollup,reviews 2>/dev/null || echo '{}')
-
-                        TOTAL_CHECKS=$(echo "$CHECK_DATA" | jq '[.statusCheckRollup // [] | .[]] | length')
-                        COMPLETED_CHECKS=$(echo "$CHECK_DATA" | jq '[.statusCheckRollup // [] | .[] | select(.status == "COMPLETED")] | length')
-                        FAILED_CHECKS=$(echo "$CHECK_DATA" | jq '[.statusCheckRollup // [] | .[] | select(.status == "COMPLETED" and .conclusion == "FAILURE")] | length')
-                        CHANGES_REQUESTED=$(echo "$CHECK_DATA" | jq '[.reviews // [] | .[] | select(.state == "CHANGES_REQUESTED")] | length')
-
-                        echo "      Checks: $COMPLETED_CHECKS/$TOTAL_CHECKS resolved, $FAILED_CHECKS failed | Changes requested: $CHANGES_REQUESTED"
-
-                        # Early exit: check failure
-                        if [ "$FAILED_CHECKS" -gt 0 ]; then
-                            echo "    x PR #$PR_NUM: check(s) FAILED."
-                            CHECKS_RESOLVED=true
-                            break
-                        fi
-
-                        # Early exit: changes requested
-                        if [ "$CHANGES_REQUESTED" -gt 0 ]; then
-                            echo "    x PR #$PR_NUM: CHANGES_REQUESTED by reviewer."
-                            CHECKS_RESOLVED=true
-                            break
-                        fi
-
-                        # Success: all checks resolved (COMPLETED status, any conclusion except FAILURE)
-                        if [ "$TOTAL_CHECKS" -gt 0 ] && [ "$COMPLETED_CHECKS" -eq "$TOTAL_CHECKS" ]; then
-                            echo "    PR #$PR_NUM: all checks passed."
-                            CHECKS_RESOLVED=true
-                            CHECKS_PASSED=true
-                            break
-                        fi
-
-                        sleep "$POLL_INTERVAL"
-                    done
-
-                    # Timeout handling
-                    if [ "$CHECKS_RESOLVED" = false ]; then
-                        echo "    x PR #$PR_NUM: timed out waiting for checks (${GHA_TIMEOUT}m)."
-                        MERGE_FAILED=$((MERGE_FAILED + 1))
-                        MERGE_BLOCKERS+=("PR #$PR_NUM: timed out waiting for checks after ${GHA_TIMEOUT}m")
-                        jq --arg pr "$PR_NUM" \
-                           '.prs[$pr].status = "timeout"' \
-                           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                        break
-                    fi
-
-                    # Check failure or changes requested
-                    if [ "$CHECKS_PASSED" = false ]; then
-                        if [ "$FAILED_CHECKS" -gt 0 ] && [ "$FIX_ATTEMPT" -lt "$MAX_FIX_ATTEMPTS" ]; then
-                            # ── Arbiter fix cycle ──
-                            FIX_ATTEMPT=$((FIX_ATTEMPT + 1))
-                            echo "    Arbiter fix attempt $FIX_ATTEMPT/$MAX_FIX_ATTEMPTS..."
-
-                            enrich_ci_context "$PR_NUM" "$FIX_ATTEMPT" "$MAX_FIX_ATTEMPTS"
-
-                            # Checkout PR branch for arbiter to work on
-                            PR_FIX_BRANCH=$(gh pr view "$PR_NUM" --json headRefName -q '.headRefName' 2>/dev/null)
-                            git checkout "$PR_FIX_BRANCH" 2>/dev/null || true
-                            git pull origin "$PR_FIX_BRANCH" 2>/dev/null || true
-                            PRE_ARBITER_HEAD=$(git rev-parse HEAD 2>/dev/null)
-
-                            if [ -z "$PRE_ARBITER_HEAD" ]; then
-                                echo "    x Failed to capture PRE_ARBITER_HEAD"
-                                git checkout main 2>/dev/null || true
-                                MERGE_BLOCKERS+=("PR #$PR_NUM: failed to capture safety anchor")
-                                MERGE_FAILED=$((MERGE_FAILED + 1))
-                                break
-                            fi
-
-                            if dispatch "/order-arbiter"; then
-                                ARB_VERDICT=$(state '.last_result.verdict')
-
-                                case "$ARB_VERDICT" in
-                                    FIXED)
-                                        echo "    Arbiter: FIXED. Dispatching review..."
-                                        if dispatch "/arbiter-review"; then
-                                            REVIEW_VERDICT=$(state '.last_result.review')
-                                            if [ "$REVIEW_VERDICT" = "APPROVED" ]; then
-                                                echo "    Review: APPROVED. Pushing fix..."
-                                                if git push origin "$PR_FIX_BRANCH" 2>/dev/null; then
-                                                    echo "    Fix pushed. Re-polling checks..."
-                                                    git checkout main 2>/dev/null || true
-                                                    # Wait for GHA to trigger on push event
-                                                    sleep 15
-                                                    continue  # re-enter check polling loop
-                                                else
-                                                    echo "    x Push failed. Reverting..."
-                                                    git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
-                                                    git checkout main 2>/dev/null || true
-                                                    MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter fix push failed")
-                                                    MERGE_FAILED=$((MERGE_FAILED + 1))
-                                                    break
-                                                fi
-                                            else
-                                                REVIEW_REASON=$(state '.last_result.review_reason // "no reason"')
-                                                echo "    Review: REJECTED — $REVIEW_REASON"
-                                                git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
-                                                git checkout main 2>/dev/null || true
-                                                MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter fix rejected by review — $REVIEW_REASON")
-                                                MERGE_FAILED=$((MERGE_FAILED + 1))
-                                                break
-                                            fi
-                                        else
-                                            echo "    x /arbiter-review crashed. Reverting..."
-                                            git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
-                                            git checkout main 2>/dev/null || true
-                                            MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter-review crashed")
-                                            MERGE_FAILED=$((MERGE_FAILED + 1))
-                                            break
-                                        fi
-                                        ;;
-                                    *)
-                                        echo "    Arbiter: $ARB_VERDICT. Reverting..."
-                                        git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
-                                        git checkout main 2>/dev/null || true
-                                        MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter verdict $ARB_VERDICT")
-                                        MERGE_FAILED=$((MERGE_FAILED + 1))
-                                        break
-                                        ;;
-                                esac
-                            else
-                                echo "    x /order-arbiter crashed. Reverting..."
-                                git reset --hard "$PRE_ARBITER_HEAD" 2>/dev/null || true
-                                git checkout main 2>/dev/null || true
-                                MERGE_BLOCKERS+=("PR #$PR_NUM: arbiter crashed")
-                                MERGE_FAILED=$((MERGE_FAILED + 1))
-                                break
-                            fi
-
-                        elif [ "$FAILED_CHECKS" -gt 0 ]; then
-                            # Max fix attempts exhausted — fall through to manual intervention
-                            echo "    x Max fix attempts ($MAX_FIX_ATTEMPTS) exhausted for PR #$PR_NUM."
-                            MERGE_BLOCKERS+=("PR #$PR_NUM: GHA check(s) failed after $MAX_FIX_ATTEMPTS fix attempts")
-                            jq --arg pr "$PR_NUM" \
-                               '.prs[$pr].status = "checks_failed"' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                            MERGE_FAILED=$((MERGE_FAILED + 1))
-                            break
-                        else
-                            MERGE_BLOCKERS+=("PR #$PR_NUM: review requested changes")
-                            jq --arg pr "$PR_NUM" \
-                               '.prs[$pr].status = "changes_requested"' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                            MERGE_FAILED=$((MERGE_FAILED + 1))
-                            break
-                        fi
-                    fi
-
-                    # ── Phase 3: Address review feedback ──
-                    if [ "$FEEDBACK_ROUND" -lt "$MAX_FEEDBACK_ROUNDS" ]; then
-                        FEEDBACK_ROUND=$((FEEDBACK_ROUND + 1))
-                        echo "    Dispatching /review-feedback (round $FEEDBACK_ROUND/$MAX_FEEDBACK_ROUNDS)..."
-
-                        # Checkout PR branch so the skill can detect the PR
-                        PR_BRANCH=$(gh pr view "$PR_NUM" --json headRefName -q '.headRefName' 2>/dev/null)
-                        if [ -n "$PR_BRANCH" ]; then
-                            git checkout "$PR_BRANCH" 2>/dev/null || true
-                            git pull origin "$PR_BRANCH" 2>/dev/null || true
-                        fi
-
-                        jq --arg pr "$PR_NUM" --arg round "feedback_round_$FEEDBACK_ROUND" \
-                           '.prs[$pr].status = $round' \
-                           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-
-                        # Capture HEAD before dispatch to detect if feedback pushed changes
-                        OLD_HEAD=$(git rev-parse HEAD 2>/dev/null)
-
-                        dispatch "/review-feedback" || true
-
-                        # Pull latest to see if feedback pushed commits to remote
-                        git pull origin "$PR_BRANCH" 2>/dev/null || true
-
-                        # Check if /review-feedback pushed any new commits
-                        NEW_HEAD=$(git rev-parse HEAD 2>/dev/null)
-
-                        # Return to main
-                        git checkout main 2>/dev/null || true
-
-                        # If no new commits were pushed, feedback was a no-op — proceed to merge
-                        if [ "$NEW_HEAD" = "$OLD_HEAD" ] || [ -z "$PR_BRANCH" ]; then
-                            echo "    No changes from feedback. Proceeding to merge."
-                            PR_MERGEABLE=true
-                            break
-                        fi
-
-                        echo "    Feedback pushed changes. Re-polling checks..."
-                        # Brief pause for GHA to trigger on synchronize event
-                        sleep 10
-                        # Loop back to Phase 2
-                        continue
-                    else
-                        echo "    Max feedback rounds ($MAX_FEEDBACK_ROUNDS) reached. Proceeding to merge."
-                        PR_MERGEABLE=true
-                        break
-                    fi
-
-                done  # feedback round loop
-
-                # Log if TODO file was generated by review-feedback
-                if [ -f ".chaos/todos/TODO-${PR_NUM}.md" ]; then
-                    echo "    Non-blocking review items saved to .chaos/todos/TODO-${PR_NUM}.md"
-                fi
-
-                # ── Phase 4: Merge the PR ──
-                if [ "$PR_MERGEABLE" = true ] || [ "$CHECKS_PASSED" = true ]; then
-                    jq --arg pr "$PR_NUM" \
-                       '.prs[$pr].status = "checks_passed"' \
-                       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-
-                    echo "    Merging PR #$PR_NUM (method: $MERGE_METHOD)..."
-
-                    MERGE_FLAGS="--$MERGE_METHOD"
-                    if [ "$DELETE_BRANCH" = "true" ]; then
-                        MERGE_FLAGS="$MERGE_FLAGS --delete-branch"
-                    fi
-
-                    if gh pr merge "$PR_NUM" $MERGE_FLAGS 2>/dev/null; then
-                        echo "    PR #$PR_NUM merged."
-                        MERGE_SUCCEEDED=$((MERGE_SUCCEEDED + 1))
-                        jq --arg pr "$PR_NUM" \
-                           '.prs[$pr].status = "merged"' \
-                           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-
-                        # Keep local main current for subsequent PRs
-                        git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
-                    else
-                        # gh pr merge can return non-zero even when the PR was merged.
-                        # Verify the actual PR state before declaring failure.
-                        sleep 3
-                        ACTUAL_STATE=$(gh pr view "$PR_NUM" --json state -q '.state' 2>/dev/null || echo "UNKNOWN")
-                        if [ "$ACTUAL_STATE" = "MERGED" ]; then
-                            echo "    PR #$PR_NUM: merge command returned error but PR is MERGED. Continuing."
-                            MERGE_SUCCEEDED=$((MERGE_SUCCEEDED + 1))
-                            jq --arg pr "$PR_NUM" \
-                               '.prs[$pr].status = "merged"' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                            git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
-                        else
-                            echo "    x PR #$PR_NUM: merge command failed (state: $ACTUAL_STATE)."
-                            MERGE_FAILED=$((MERGE_FAILED + 1))
-                            MERGE_BLOCKERS+=("PR #$PR_NUM: gh pr merge command failed")
-                            jq --arg pr "$PR_NUM" \
-                               '.prs[$pr].status = "merge_failed"' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                        fi
-                    fi
-                fi
-
-            done  # PR loop
-
-            # Cleanup stale arbiter_context — runs on all exit paths (success, failure, timeout)
-            if jq -e '.arbiter_context' "$STATE_FILE" >/dev/null 2>&1; then
-                jq 'del(.arbiter_context)' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-            fi
-
-            # Cleanup CI failure logs for merged PRs
-            for ci_log in .chaos/framework/order/ci-failure-*.log; do
-                [ -f "$ci_log" ] || continue
-                log_pr=$(basename "$ci_log" | sed 's/ci-failure-\([0-9]*\)\.log/\1/')
-                log_status=$(jq -r ".prs[\"$log_pr\"].status // \"unknown\"" "$STATE_FILE" 2>/dev/null)
-                if [ "$log_status" = "merged" ]; then
-                    rm -f "$ci_log"
-                fi
+                MERGE_SUCCEEDED=$((MERGE_SUCCEEDED + 1))
             done
 
-            echo "  Merge results: $MERGE_SUCCEEDED merged, $MERGE_FAILED failed"
+            # Cleanup
+            cleanup_merge_artifacts
+
+            log INFO "Merge results: $MERGE_SUCCEEDED merged, $MERGE_FAILED failed"
 
             # ── Decide next state ──
-            # Count remaining tasks not yet completed or failed
             PROCESSED=$(jq '[.completed // [], .failed // []] | flatten | length' "$STATE_FILE")
-            TOTAL_Q=$(grep -cvE '^[[:space:]]*(#|$)' "$QUEUE_FILE" 2>/dev/null || echo "0")
+            TOTAL_Q=$(count_queue_tasks)
             REMAINING=$((TOTAL_Q - PROCESSED))
 
             if [ "$MERGE_FAILED" -eq 0 ]; then
-                # PR merged successfully
-                echo "  Pulling latest main after merge..."
+                log INFO "Pulling latest main after merge"
                 git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
 
                 if [ "$REMAINING" -gt 0 ]; then
-                    echo "  $REMAINING task(s) remaining. Continuing to next task."
+                    log INFO "$REMAINING task(s) remaining. Continuing to next task."
                     jq --arg time "$(date -Iseconds)" \
                        '.current_state = "PLAN_WORK" | .last_transition = $time | .last_result = {skill: "merge-prs", verdict: "MERGED_CONTINUING"}' \
-                       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                 else
-                    echo "  All tasks complete. Advancing to verification."
+                    log INFO "All tasks complete. Advancing to verification."
                     jq --arg time "$(date -Iseconds)" \
                        '.current_state = "VERIFY_COMPLETION" | .last_transition = $time | .last_result = {skill: "merge-prs", verdict: "ALL_MERGED"}' \
-                       "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                 fi
             else
-                # Merge failed -> invoke arbiter
-                echo "  Merge failure detected. Invoking arbiter..."
-
+                log ERROR "Merge failure detected. Invoking arbiter."
                 BLOCKERS_JSON=$(printf '%s\n' "${MERGE_BLOCKERS[@]}" | jq -R . | jq -s .)
+
                 jq --arg time "$(date -Iseconds)" \
                    --argjson blockers "$BLOCKERS_JSON" \
                    --argjson failures "$MERGE_FAILED" \
                    '.last_result = {skill: "merge-prs", verdict: "MERGE_BLOCKED", blockers: $blockers, failures: $failures} | .last_transition = $time' \
-                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                   "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
 
-                dispatch "/order-arbiter" || exit 1
-                ARB=$(state '.last_result.verdict')
+                ARB=$(invoke_arbiter)
+
                 case "$ARB" in
                     RETRY)
-                        echo "  Arbiter: RETRY merge."
+                        log INFO "Arbiter: RETRY merge."
                         jq --arg time "$(date -Iseconds)" \
                            '.current_state = "MERGE_PRS" | .last_transition = $time | del(.last_result)' \
-                           "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                           "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                         ;;
                     SKIP)
-                        echo "  Arbiter: SKIP merge failure."
+                        log INFO "Arbiter: SKIP merge failure."
                         git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
                         if [ "$REMAINING" -gt 0 ]; then
-                            echo "  $REMAINING task(s) remaining. Continuing to next task."
+                            log INFO "$REMAINING task(s) remaining. Continuing to next task."
                             jq --arg time "$(date -Iseconds)" \
                                '.current_state = "PLAN_WORK" | .last_transition = $time | del(.last_result)' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                               "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                         else
-                            echo "  No more tasks. Advancing to verification."
+                            log INFO "No more tasks. Advancing to verification."
                             jq --arg time "$(date -Iseconds)" \
                                '.current_state = "VERIFY_COMPLETION" | .last_transition = $time' \
-                               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                               "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                         fi
                         ;;
                     *)
-                        echo "  x Arbiter: HALT."
+                        log ERROR "Arbiter: HALT (verdict: $ARB)"
                         exit 1
                         ;;
                 esac
             fi
+            log_state_summary
             ;;
 
-        # ── VERIFY_COMPLETION: Create handoff document ──
+        # ── VERIFY_COMPLETION: Create handoff document ────────────
         VERIFY_COMPLETION)
             STEP=$(state '.step_number')
-            dispatch "/handoff $STEP" || exit 1
+            log INFO "Verifying completion for step $STEP"
+            dispatch_or_recover "/handoff $STEP" "HANDOFF"
+            dr_rc=$?
+            if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
+            if [ "$dr_rc" -eq 3 ]; then exit 1; fi
+            log INFO "Handoff dispatched"
+            log_state_summary
             ;;
 
-        # ── HANDOFF: Step complete, reset for next step ──
+        # ── HANDOFF: Step complete, reset for next step ───────────
         HANDOFF)
             STEP=$(state '.step_number')
-            echo ""
-            echo "=== Step $STEP Complete ==="
-            echo ""
+            log_separator "Step $STEP Complete"
 
-            # Reset state to INIT for next roadmap step
             jq '.current_state = "INIT" | del(.last_result)' \
-                "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
             revision_count=0
             ;;
 
         *)
-            echo "x Unknown state: $CURRENT"
-            exit 1
+            log ERROR "Unknown state: $CURRENT. Resetting to INIT."
+            jq --arg time "$(date -Iseconds)" \
+               '.current_state = "INIT" | .last_transition = $time | del(.last_result)' \
+               "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
             ;;
     esac
 done
 
-echo ""
-echo "=== ORDER Loop Complete ==="
-echo "Steps run: $step_count"
+log_separator "ORDER Loop Complete"
+log INFO "Steps run: $step_count"

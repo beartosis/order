@@ -94,6 +94,14 @@ lifecycle:
 orchestrator:
   max_spec_revisions: 3          # Max create-spec/review-spec cycles before arbiter
   execution_mode: sequential     # Tasks execute one at a time, each merged before the next begins
+  dispatch_timeout_seconds: 1800 # Max wall-clock time per skill dispatch (30 min)
+
+# Self-healing recovery settings
+recovery:
+  max_dispatch_retries: 2              # Retry skill dispatch N times before arbiter
+  dispatch_retry_delay_seconds: 30     # Delay between dispatch retries
+  max_arbiter_retries: 2               # Retry arbiter N times if it crashes
+  arbiter_retry_delay_seconds: 15      # Delay between arbiter retries
 
 # Notification (future)
 notify:
