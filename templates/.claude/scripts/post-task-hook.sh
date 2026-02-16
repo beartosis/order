@@ -52,7 +52,9 @@ if command -v gh &>/dev/null; then
 fi
 
 # --- Recovery: commit + push + PR if work exists but no PR ---
-if [[ "$EXIT_CODE" -eq 0 ]] && [[ -z "$PR_NUM" ]]; then
+# Fires on clean exit (0) or timeout (124) — timeout with uncommitted work
+# means the task finished coding but ran out of clock before pushing.
+if { [[ "$EXIT_CODE" -eq 0 ]] || [[ "$EXIT_CODE" -eq 124 ]]; } && [[ -z "$PR_NUM" ]]; then
     BRANCH=$(git branch --show-current 2>/dev/null || echo "")
     if [[ "$BRANCH" == task/* ]]; then
         # Stage code changes (explicit dirs, never -A)
@@ -72,9 +74,15 @@ if [[ "$EXIT_CODE" -eq 0 ]] && [[ -z "$PR_NUM" ]]; then
 fi
 
 # --- Determine result ---
+# A task is successful if a PR exists AND the exit was clean (0) or a timeout (124).
+# Exit 124 = `timeout` killed the process. If the task produced a PR before being
+# killed, the work is done — the MERGE_PRS phase handles review and merge.
 
-if [[ "$EXIT_CODE" -eq 0 ]] && [[ -n "$PR_NUM" ]]; then
+if [[ -n "$PR_NUM" ]] && { [[ "$EXIT_CODE" -eq 0 ]] || [[ "$EXIT_CODE" -eq 124 ]]; }; then
     STATUS="success"
+    if [[ "$EXIT_CODE" -eq 124 ]]; then
+        echo "  NOTE: Task timed out (exit 124) but PR #${PR_NUM} exists. Treating as success."
+    fi
 else
     STATUS="failed"
 fi

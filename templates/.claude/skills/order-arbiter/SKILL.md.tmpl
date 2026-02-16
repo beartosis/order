@@ -25,6 +25,22 @@ Check if `arbiter_context` exists in state.json:
 - **Present** → CI Fix Mode (investigate, fix, commit)
 - **Absent** → Decision-Only Mode (legacy RETRY/SKIP/HALT)
 
+## CRITICAL: Independent PR Discovery
+
+**Do NOT rely solely on `state.json` for PR information.** The state may be incomplete (e.g., post-task hook failed to register a PR due to timeout).
+
+Before deciding, **always check GitHub directly** for the failed task:
+
+```bash
+# Extract failed task ID from state
+TASK_ID=$(jq -r '.failed // [] | last // empty' .chaos/framework/order/state.json)
+
+# Check GitHub for PRs on the task branch (any state: open, draft, merged)
+gh pr list --head "task/$TASK_ID" --state all --json number,state,isDraft,title
+```
+
+**If a PR exists for a "failed" task**: the task likely timed out but completed its work. Choose **RETRY** (which routes back to MERGE_PRS) rather than HALT. The PR just needs review and merge — no code work is needed.
+
 ---
 
 ## CI Fix Mode
@@ -184,6 +200,12 @@ When `arbiter_context` is absent, you are the autonomous decision-maker. Analyze
 - Tests failing across multiple tasks (systemic issue)
 
 ### PR-Aware Decisions
+
+**Task Timed Out But PR Exists**:
+- Check: `gh pr list --head "task/$TASK_ID" --state all`
+- PR open/draft → RETRY (work is done, just needs merge pipeline)
+- PR merged → SKIP (task already succeeded, state tracking error)
+- No PR → Genuine failure, evaluate other criteria
 
 **PR Review Failed**:
 - Actionable feedback → RETRY with review feedback as guidance
