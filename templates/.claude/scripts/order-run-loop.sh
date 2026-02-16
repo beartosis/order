@@ -63,7 +63,8 @@ init_logging() {
     ln -sf "$(basename "$LOG_FILE")" "$LOG_DIR/latest.log" 2>/dev/null || true
 }
 
-# Start a new log file for a specific step
+# Start a new log file for a specific step.
+# The previous log file (init or prior step) is left intact.
 start_step_log() {
     local step="$1" title="${2:-}"
     local sanitized
@@ -71,12 +72,6 @@ start_step_log() {
     local timestamp
     timestamp=$(date +%Y%m%dT%H%M%S)
     local new_log="$LOG_DIR/step-${step}${sanitized:+-$sanitized}-${timestamp}.log"
-
-    # Copy init-phase entries to new log
-    if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
-        cp "$LOG_FILE" "$new_log"
-        # Keep the old init log too (don't delete)
-    fi
 
     LOG_FILE="$new_log"
     ln -sf "$(basename "$LOG_FILE")" "$LOG_DIR/latest.log" 2>/dev/null || true
@@ -358,9 +353,10 @@ dispatch() {
 
 # Crash-resilient arbiter invocation.
 # Dispatches /order-arbiter with retry on crash or empty verdict.
-# Prints verdict to stdout. Caller captures with: ARB=$(invoke_arbiter)
-# Returns 0 on success (verdict is valid), 1 on total failure (verdict is "HALT").
+# Sets ARBITER_VERDICT to the verdict string (or "HALT" on total failure).
+# Returns 0 on success (verdict is valid), 1 on total failure.
 invoke_arbiter() {
+    ARBITER_VERDICT=""
     local max_retries arbiter_delay
     max_retries=$(config "max_arbiter_retries" "2")
     arbiter_delay=$(config "arbiter_retry_delay_seconds" "15")
@@ -382,11 +378,11 @@ invoke_arbiter() {
                     continue
                 fi
                 log ERROR "Arbiter returned empty verdict on all attempts. Defaulting to HALT."
-                echo "HALT"
+                ARBITER_VERDICT="HALT"
                 return 1
             fi
 
-            echo "$verdict"
+            ARBITER_VERDICT="$verdict"
             return 0
         fi
 
@@ -398,7 +394,7 @@ invoke_arbiter() {
     done
 
     log ERROR "Arbiter failed after $max_retries attempts. Defaulting to HALT."
-    echo "HALT"
+    ARBITER_VERDICT="HALT"
     return 1
 }
 
@@ -448,8 +444,8 @@ dispatch_or_recover() {
        '.last_result = {skill: $skill, verdict: "DISPATCH_FAILED", reason: "Exhausted retries"} | .last_transition = $time' \
        "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
 
-    local arb_verdict
-    arb_verdict=$(invoke_arbiter)
+    invoke_arbiter
+    local arb_verdict="$ARBITER_VERDICT"
 
     case "$arb_verdict" in
         RETRY)
@@ -472,6 +468,20 @@ dispatch_or_recover() {
             log ERROR "Arbiter: HALT (verdict: $arb_verdict)"
             return 3
             ;;
+    esac
+}
+
+# Handle dispatch_or_recover return code in the main loop.
+# Usage: dispatch_or_recover ... ; handle_dispatch_rc $? || continue
+# Returns 0 if dispatch succeeded, exits on HALT, returns 1 on RETRY/SKIP
+# (caller should use `|| continue` to re-enter the loop).
+handle_dispatch_rc() {
+    local rc="$1"
+    case "$rc" in
+        0) return 0 ;;
+        1|2) return 1 ;;  # RETRY or SKIP — caller should continue loop
+        3) exit 1 ;;      # HALT
+        *) exit 1 ;;      # unexpected — fail safe
     esac
 }
 
@@ -535,20 +545,12 @@ archive_merged_prs() {
     fi
 
     # Remove archived PRs from state (oldest N merged)
-    local keys_to_remove
-    keys_to_remove=$(jq -r "[.prs // {} | to_entries[] | select(.value.status == \"merged\")] | sort_by(.key | tonumber) | .[:$archive_count][] | .key" "$STATE_FILE" 2>/dev/null)
-
-    if [ -n "$keys_to_remove" ]; then
-        local jq_del=""
-        for key in $keys_to_remove; do
-            jq_del="$jq_del | del(.prs[\"$key\"])"
-        done
-        # Remove leading " | "
-        jq_del="${jq_del# | }"
-
-        jq "$jq_del" "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
-        log INFO "Archived $archive_count merged PRs to $archive_file"
-    fi
+    jq --argjson n "$archive_count" '
+        ([.prs // {} | to_entries[] | select(.value.status == "merged")]
+         | sort_by(.key | tonumber) | .[:$n] | .[].key) as $keys
+        | reduce ($keys | .[]) as $k (.; del(.prs[$k]))
+    ' "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+    log INFO "Archived $archive_count merged PRs to $archive_file"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -677,13 +679,45 @@ try_simple_conflict_resolution() {
 auto_fix_formatting() {
     local pr_branch="$1"
 
+    # Prefer project-specific auto-fix script if available
     if [ -f ".claude/scripts/auto-fix.sh" ]; then
         log INFO "Running project auto-fix script on $pr_branch"
         bash .claude/scripts/auto-fix.sh "$pr_branch" 2>&1 | while IFS= read -r line; do
             log DEBUG "auto-fix: $line"
         done
+        return
+    fi
+
+    # Built-in fallback: detect and run common formatters
+    local changed=false
+
+    # Frontend (web/)
+    if [ -d "web" ] && [ -f "web/package.json" ]; then
+        log INFO "Running frontend lint:fix + prettier"
+        (cd web && npx eslint . --fix 2>/dev/null || true)
+        (cd web && npx prettier --write "src/**/*.{ts,tsx,css}" 2>/dev/null || true)
+        if ! git diff --quiet -- web/ 2>/dev/null; then
+            git diff --name-only -- web/ | xargs -r git add
+            changed=true
+        fi
+    fi
+
+    # Go
+    if [ -f "go.mod" ]; then
+        log INFO "Running go fmt"
+        go fmt ./... 2>/dev/null || true
+        if ! git diff --quiet 2>/dev/null; then
+            git diff --name-only -- '*.go' 'go.mod' 'go.sum' | xargs -r git add
+            changed=true
+        fi
+    fi
+
+    if [ "$changed" = true ]; then
+        git commit -m "style: auto-fix lint and formatting" 2>/dev/null || true
+        git push origin "$pr_branch" 2>/dev/null || true
+        log INFO "Auto-fix committed and pushed"
     else
-        log DEBUG "No auto-fix script found at .claude/scripts/auto-fix.sh"
+        log DEBUG "No formatting changes needed"
     fi
 }
 
@@ -1157,7 +1191,9 @@ merge_do_merge() {
     return 1
 }
 
-# Discover PRs from queue when state.json has none registered
+# Discover PRs from queue when state.json has none registered.
+# Prints discovered PR numbers to stdout for capture by caller.
+# All log output is redirected to stderr to avoid polluting stdout.
 discover_prs() {
     local queue_count
     queue_count=$(count_queue_tasks)
@@ -1166,7 +1202,7 @@ discover_prs() {
         return 0
     fi
 
-    log WARN "$queue_count tasks in queue but no PRs in state. Attempting discovery."
+    log WARN "$queue_count tasks in queue but no PRs in state. Attempting discovery." >&2
     local discovered=0
 
     while IFS='|' read -r disc_task_id disc_rest; do
@@ -1199,7 +1235,7 @@ discover_prs() {
         fi
 
         if [[ -n "$disc_pr" ]]; then
-            log INFO "Discovered PR #$disc_pr for task $disc_task_id"
+            log INFO "Discovered PR #$disc_pr for task $disc_task_id" >&2
             jq --arg pr "$disc_pr" --arg task "$disc_task_id" \
                 '.prs[$pr] = {"task": $task, "status": "draft"}' \
                 "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
@@ -1208,11 +1244,11 @@ discover_prs() {
     done < "$QUEUE_FILE"
 
     if [ "$discovered" -eq 0 ]; then
-        log ERROR "Could not discover any PRs for $queue_count queued tasks."
+        log ERROR "Could not discover any PRs for $queue_count queued tasks." >&2
         return 0  # return empty, caller handles
     fi
 
-    log INFO "Discovered $discovered PRs."
+    log INFO "Discovered $discovered PRs." >&2
     # Return the newly discovered PR numbers
     jq -r '.prs // {} | to_entries[] | select(.value.status == "merged" | not) | .key' "$STATE_FILE" 2>/dev/null
 }
@@ -1289,9 +1325,7 @@ while true; do
         # ── INIT: Parse roadmap for next uncompleted step ──────────
         INIT)
             dispatch_or_recover "/parse-roadmap" "NONE"
-            dr_rc=$?
-            if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
-            if [ "$dr_rc" -eq 3 ]; then exit 1; fi
+            handle_dispatch_rc $? || continue
 
             VERDICT=$(state '.last_result.verdict')
             if [ "$VERDICT" = "ROADMAP_COMPLETE" ]; then
@@ -1328,9 +1362,7 @@ while true; do
             fi
 
             dispatch_or_recover "/create-spec $STEP" "INIT"
-            dr_rc=$?
-            if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
-            if [ "$dr_rc" -eq 3 ]; then exit 1; fi
+            handle_dispatch_rc $? || continue
             log INFO "Spec created: $(state '.spec_id')"
             log_state_summary
             ;;
@@ -1343,7 +1375,7 @@ while true; do
 
                 if [ "$revision_count" -gt "$MAX_REV" ]; then
                     log WARN "Max revisions ($MAX_REV) exceeded. Invoking arbiter."
-                    ARB=$(invoke_arbiter)
+                    invoke_arbiter; ARB="$ARBITER_VERDICT"
                     case "$ARB" in
                         SKIP)
                             log INFO "Arbiter: SKIP. Advancing to next step."
@@ -1366,16 +1398,12 @@ while true; do
                 log INFO "Revision $revision_count/$MAX_REV -- re-creating spec"
                 STEP=$(state '.step_number')
                 dispatch_or_recover "/create-spec $STEP" "INIT"
-                dr_rc=$?
-                if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
-                if [ "$dr_rc" -eq 3 ]; then exit 1; fi
+                handle_dispatch_rc $? || continue
             else
                 SPEC_ID=$(state '.spec_id')
                 log INFO "Reviewing spec: specs/$SPEC_ID/SPEC.md"
                 dispatch_or_recover "/review-spec specs/$SPEC_ID/SPEC.md" "REVIEW_SPEC"
-                dr_rc=$?
-                if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
-                if [ "$dr_rc" -eq 3 ]; then exit 1; fi
+                handle_dispatch_rc $? || continue
 
                 NEW_VERDICT=$(state '.last_result.verdict')
                 log INFO "Review verdict: $NEW_VERDICT"
@@ -1391,9 +1419,7 @@ while true; do
             SPEC_ID=$(state '.spec_id')
             log INFO "Planning work for specs/$SPEC_ID/SPEC.md"
             dispatch_or_recover "/plan-work specs/$SPEC_ID/SPEC.md" "INIT"
-            dr_rc=$?
-            if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
-            if [ "$dr_rc" -eq 3 ]; then exit 1; fi
+            handle_dispatch_rc $? || continue
             log INFO "Tasks created: $(state '.last_result.task_count')"
             log_state_summary
             ;;
@@ -1513,7 +1539,7 @@ while true; do
         EXECUTE_TASKS)
             if [ "$VERDICT" = "TASKS_FAILED" ]; then
                 log WARN "Task failed. Invoking arbiter."
-                ARB=$(invoke_arbiter)
+                invoke_arbiter; ARB="$ARBITER_VERDICT"
 
                 case "$ARB" in
                     RETRY)
@@ -1652,7 +1678,7 @@ while true; do
                    '.last_result = {skill: "merge-prs", verdict: "MERGE_BLOCKED", blockers: $blockers, failures: $failures} | .last_transition = $time' \
                    "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
 
-                ARB=$(invoke_arbiter)
+                invoke_arbiter; ARB="$ARBITER_VERDICT"
 
                 case "$ARB" in
                     RETRY)
@@ -1690,9 +1716,7 @@ while true; do
             STEP=$(state '.step_number')
             log INFO "Verifying completion for step $STEP"
             dispatch_or_recover "/handoff $STEP" "HANDOFF"
-            dr_rc=$?
-            if [ "$dr_rc" -eq 1 ] || [ "$dr_rc" -eq 2 ]; then continue; fi
-            if [ "$dr_rc" -eq 3 ]; then exit 1; fi
+            handle_dispatch_rc $? || continue
             log INFO "Handoff dispatched"
             log_state_summary
             ;;
@@ -1708,10 +1732,8 @@ while true; do
             ;;
 
         *)
-            log ERROR "Unknown state: $CURRENT. Resetting to INIT."
-            jq --arg time "$(date -Iseconds)" \
-               '.current_state = "INIT" | .last_transition = $time | del(.last_result)' \
-               "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+            log ERROR "Unknown state: $CURRENT"
+            exit 1
             ;;
     esac
 done
