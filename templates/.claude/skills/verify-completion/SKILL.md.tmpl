@@ -32,8 +32,8 @@ fi
 ### Step 2: Load Spec Contract
 
 ```bash
-# Find the spec for this step
-SPEC_DIR=$(ls -d specs/step-${STEP_NUM}-* 2>/dev/null | head -1)
+# Find the spec for this step (specs use sequential numbering, look up by Step Reference)
+SPEC_DIR=$(grep -rl "^- Step: ${STEP_NUM}$" specs/*/SPEC.md 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
 if [ -z "$SPEC_DIR" ]; then
   echo "ERROR: No spec found for step $STEP_NUM"
   exit 1

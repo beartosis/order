@@ -64,7 +64,7 @@ From the matched line, extract:
 ```bash
 # Check if spec already exists for this step
 STEP_NUM=<extracted step number>
-ls specs/step-${STEP_NUM}-*/SPEC.md 2>/dev/null
+grep -rl "^- Step: ${STEP_NUM}$" specs/*/SPEC.md 2>/dev/null
 ```
 
 If spec exists, return `SPEC_EXISTS` with the path.

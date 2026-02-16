@@ -96,9 +96,10 @@ Write the full Spec Contract following the required format (see below).
 ### Step 8: Write Spec File
 
 ```bash
-# Create spec directory
+# Create spec directory using zero-padded step number
 SLUG=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')
-SPEC_DIR="specs/step-${STEP_NUM}-${SLUG}"
+NEXT_NUM=$(printf "%03d" "$STEP_NUM")
+SPEC_DIR="specs/${NEXT_NUM}-${SLUG}"
 mkdir -p "$SPEC_DIR"
 
 # Write spec
@@ -120,11 +121,11 @@ sed -i "s/^${STEP_NUM}\. \[ \]/\${STEP_NUM}. [S]/" docs/ROADMAP.md
 # Update state.json to CREATE_SPEC and write last_result for orchestrator
 cat .chaos/framework/order/state.json | jq \
   --arg state "CREATE_SPEC" \
-  --arg spec "step-${STEP_NUM}-${SLUG}" \
+  --arg spec "${NEXT_NUM}-${SLUG}" \
   --arg time "$(date -Iseconds)" \
   --arg skill "create-spec" \
   --arg verdict "SPEC_CREATED" \
-  --arg spec_path "specs/step-${STEP_NUM}-${SLUG}/SPEC.md" \
+  --arg spec_path "specs/${NEXT_NUM}-${SLUG}/SPEC.md" \
   '.current_state = $state | .spec_id = $spec | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}] | .last_result = {skill: $skill, verdict: $verdict, spec_path: $spec_path}' \
   > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
 ```
@@ -133,12 +134,12 @@ Output:
 ```markdown
 ## Spec Contract Created
 
-**Path**: specs/step-{N}-{slug}/SPEC.md
+**Path**: specs/{NNN}-{slug}/SPEC.md
 **Step**: {N} - {title}
 **Complexity**: {rating}
 
 ### Next Action
-Run `/review-spec specs/step-{N}-{slug}/SPEC.md` to validate the spec.
+Run `/review-spec specs/{NNN}-{slug}/SPEC.md` to validate the spec.
 ```
 
 ---
