@@ -1,0 +1,127 @@
+---
+name: revise-spec
+description: |
+  Revise an existing Spec Contract based on review feedback.
+  Reads issues from state.json.last_result.issues, applies fixes
+  in-place to the existing SPEC.md.
+  INTERNAL - invoked by ORDER loop on NEEDS_REVISION.
+disable-model-invocation: true
+allowed-tools: Read, Grep, Glob, Bash, Write, Edit
+user-invocable: false
+---
+
+# Revise Spec: Apply Review Feedback to Existing Spec Contract
+
+When `/review-spec` returns `NEEDS_REVISION`, this skill reads the specific issues identified by the reviewer and fixes them in the existing `SPEC.md`. You are the developer revising your own work based on code review feedback.
+
+> **Self-Validation Invariant**: After you revise the spec, `/review-spec` will independently validate your changes in a forked context. You do NOT review your own work.
+
+## Workflow
+
+### Step 1: Read Review Issues
+
+```bash
+# Get the spec path and review issues
+SPEC_ID=$(jq -r '.spec_id' .chaos/framework/order/state.json)
+SPEC_PATH="specs/${SPEC_ID}/SPEC.md"
+
+# Read the issues array from the last review
+jq -r '.last_result.issues[]' .chaos/framework/order/state.json
+```
+
+If `spec_id` is empty or the spec file doesn't exist, exit with error.
+
+### Step 2: Read the Existing Spec
+
+```bash
+cat "$SPEC_PATH"
+```
+
+Read the full spec so you understand its current state.
+
+### Step 3: Read Project Context
+
+Gather the same context that `/create-spec` uses, so your fixes are grounded in reality:
+
+```bash
+# Standards and learnings
+cat standards/standards.yml 2>/dev/null
+cat .chaos/learnings.md 2>/dev/null
+
+# Architecture context
+cat docs/architecture.md 2>/dev/null
+
+# Existing codebase patterns relevant to the issues
+# (search based on what the issues reference)
+```
+
+### Step 4: Investigate Each Issue
+
+For each issue in the `last_result.issues` array:
+
+1. **Understand the issue**: What exactly is wrong? Is it a factual error (wrong function name), a missing detail (vague criteria), or a pattern mismatch (wrong SQL convention)?
+
+2. **Verify against codebase**: Check the actual codebase to determine the correct answer. Don't guess.
+   - If the issue mentions a wrong trigger function name, find the real one in migrations
+   - If the issue mentions a missing interface, check what exists in the referenced package
+   - If the issue mentions a convention mismatch, check other tables/migrations for the pattern
+
+3. **Identify the spec section** to modify (Step Reference, Purpose, In Scope, Out of Scope, Constraints, Required Interfaces, Technical Approach, Risks, Acceptance Criteria, Decomposition Notes).
+
+### Step 5: Apply Fixes
+
+For each issue, edit the spec in-place using the `Edit` tool:
+
+- Fix factual errors (wrong names, wrong function references, wrong SQL syntax)
+- Tighten vague acceptance criteria to be testable
+- Add missing constraints or interface details
+- Update technical approach to match actual codebase patterns
+- Fix migration SQL to match established conventions
+
+**Rules for revision**:
+- Only change what the review issues require. Do not rewrite unrelated sections.
+- Preserve the existing spec structure and formatting.
+- Every fix must be grounded in codebase verification, not assumptions.
+- If an issue requires adding new content, add the minimum necessary.
+
+### Step 6: Write Verdict
+
+```bash
+SPEC_PATH="specs/${SPEC_ID}/SPEC.md"
+
+jq --arg skill "revise-spec" \
+   --arg verdict "REVISED" \
+   --arg path "$SPEC_PATH" \
+   --arg time "$(date -Iseconds)" \
+   '.last_result = {skill: $skill, verdict: $verdict, spec_path: $path} | .last_transition = $time' \
+   .chaos/framework/order/state.json > .chaos/framework/order/state.json.tmp \
+   && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+Output a summary:
+```markdown
+## Spec Revised
+
+**Path**: specs/{spec_id}/SPEC.md
+**Issues addressed**: N
+
+### Changes Made
+- <description of fix 1>
+- <description of fix 2>
+
+### Next Action
+The ORDER loop will dispatch `/review-spec` to independently validate the revised spec.
+```
+
+---
+
+## CRITICAL Rules
+
+1. **Read the issues first** — Every change must address a specific review issue
+2. **Verify against codebase** — Don't guess. Check actual files, migrations, function names
+3. **Minimal changes** — Only fix what the review flagged. Don't rewrite the whole spec
+4. **Preserve structure** — Keep all 10 required Spec Contract sections intact
+5. **Edit in-place** — Use the Edit tool on the existing file. Never create a new file
+6. **Do NOT transition state** — Write `REVISED` to `last_result.verdict` only. The loop handles state transitions
+7. **Do NOT review your own work** — `/review-spec` runs independently afterward
+8. **Ground in standards and learnings** — Check `.chaos/learnings.md` and `standards/` for established patterns

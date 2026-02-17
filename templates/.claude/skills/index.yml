@@ -15,7 +15,7 @@
 categories:
   roadmap:
     description: Roadmap-driven spec creation and progression
-    skills: [parse-roadmap, create-spec, review-spec]
+    skills: [parse-roadmap, create-spec, review-spec, revise-spec]
 
   planning:
     description: Spec decomposition and task creation
@@ -39,7 +39,7 @@ categories:
 
   internal:
     description: Internal decision-making (not for direct use)
-    skills: [work-wrapper, order-oracle, order-arbiter]
+    skills: [work-wrapper, order-oracle, order-arbiter, fix-ci]
 
   monitoring:
     description: Status and observability
@@ -53,4 +53,4 @@ categories:
 # Verification:  /verify-completion <step-num>
 # Lifecycle:     /order-run [--step N], /handoff <step-num>, /order-resume <handoff-file>
 # Monitoring:    /order-status
-# Internal:      /order-oracle, /order-arbiter, /work-wrapper
+# Internal:      /order-oracle, /order-arbiter, /fix-ci, /work-wrapper

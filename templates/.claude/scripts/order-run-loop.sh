@@ -1009,11 +1009,27 @@ merge_poll_and_fix() {
             return 0
         fi
 
-        # ── Checks failed — try arbiter fix ──
+        # ── Checks failed — try worker fix first, then arbiter ──
         if [ "$failed_checks" -gt 0 ] && [ "$fix_attempt" -lt "$max_fix" ]; then
             fix_attempt=$((fix_attempt + 1))
-            log INFO "Arbiter fix attempt $fix_attempt/$max_fix for PR #$pr_num"
 
+            # Tier 1: Worker self-correction (first N attempts)
+            local worker_max
+            worker_max=$(config "max_worker_fix_attempts" "1")
+
+            if [ "$fix_attempt" -le "$worker_max" ]; then
+                log INFO "Fix attempt $fix_attempt/$max_fix for PR #$pr_num (tier: worker)"
+                if merge_worker_fix_cycle "$pr_num" "$fix_attempt" "$max_fix"; then
+                    log INFO "Worker fix pushed. Re-polling checks."
+                    sleep 15
+                    continue  # re-enter check polling loop
+                fi
+                log WARN "Worker fix failed. Next attempt will use arbiter."
+                continue  # re-enter loop with incremented fix_attempt
+            fi
+
+            # Tier 2: Arbiter tactical fix (remaining attempts)
+            log INFO "Fix attempt $fix_attempt/$max_fix for PR #$pr_num (tier: arbiter)"
             if merge_arbiter_fix_cycle "$pr_num" "$fix_attempt" "$max_fix"; then
                 log INFO "Arbiter fix pushed. Re-polling checks."
                 sleep 15
@@ -1147,6 +1163,52 @@ merge_arbiter_fix_cycle() {
             return 1
             ;;
     esac
+}
+
+# Worker CI fix sub-cycle: checkout PR branch, run /fix-ci, push.
+# The worker has full codebase access and no scope limits (unlike the arbiter).
+# Returns 0 if fix was pushed successfully, 1 otherwise.
+merge_worker_fix_cycle() {
+    local pr_num="$1" fix_attempt="$2" max_attempts="$3"
+
+    enrich_ci_context "$pr_num" "$fix_attempt" "$max_attempts"
+
+    local pr_branch
+    pr_branch=$(gh pr view "$pr_num" --json headRefName -q '.headRefName' 2>/dev/null)
+    git checkout "$pr_branch" 2>/dev/null || true
+    git pull origin "$pr_branch" 2>/dev/null || true
+
+    local pre_head
+    pre_head=$(git rev-parse HEAD 2>/dev/null)
+    if [ -z "$pre_head" ]; then
+        log ERROR "Failed to capture pre-worker-fix HEAD"
+        git checkout main 2>/dev/null || true
+        return 1
+    fi
+
+    log INFO "Dispatching /fix-ci for PR #$pr_num (worker fix)"
+
+    if dispatch "/fix-ci" "$WORK_MODEL"; then
+        local fix_verdict
+        fix_verdict=$(state '.last_result.verdict')
+
+        if [ "$fix_verdict" = "FIXED" ]; then
+            log INFO "Worker fix: FIXED. Pushing."
+            if git push origin "$pr_branch" 2>/dev/null; then
+                git checkout main 2>/dev/null || true
+                return 0
+            fi
+            log ERROR "Worker fix push failed. Reverting."
+        else
+            log WARN "Worker fix verdict: $fix_verdict. Reverting to let arbiter try."
+        fi
+    else
+        log ERROR "Worker fix dispatch failed. Reverting."
+    fi
+
+    git reset --hard "$pre_head" 2>/dev/null || true
+    git checkout main 2>/dev/null || true
+    return 1
 }
 
 # Phase 4: Merge the PR
@@ -1395,9 +1457,8 @@ while true; do
                     esac
                 fi
 
-                log INFO "Revision $revision_count/$MAX_REV -- re-creating spec"
-                STEP=$(state '.step_number')
-                dispatch_or_recover "/create-spec $STEP" "INIT"
+                log INFO "Revision $revision_count/$MAX_REV -- revising spec from review feedback"
+                dispatch_or_recover "/revise-spec" "INIT"
                 handle_dispatch_rc $? || continue
             else
                 SPEC_ID=$(state '.spec_id')

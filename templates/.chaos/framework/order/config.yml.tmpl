@@ -102,6 +102,7 @@ recovery:
   dispatch_retry_delay_seconds: 30     # Delay between dispatch retries
   max_arbiter_retries: 2               # Retry arbiter N times if it crashes
   arbiter_retry_delay_seconds: 15      # Delay between arbiter retries
+  max_worker_fix_attempts: 1           # How many CI fix attempts use /fix-ci before arbiter
 
 # Notification (future)
 notify:
