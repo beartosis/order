@@ -216,6 +216,53 @@ state_summary() {
     }' "$STATE_FILE"
 }
 
+# Mark a ROADMAP step as [X] (complete).
+# Handles all intermediate states: [ ] (uncompleted), [S] (spec created), [T] (tasks created).
+mark_roadmap_step_complete() {
+    local step="$1"
+    if [ -z "$step" ] || [ ! -f "docs/ROADMAP.md" ]; then
+        return 0
+    fi
+    if grep -qP "^${step}\\. \\[[ ST]\\]" docs/ROADMAP.md; then
+        sed -i -E "s/^${step}\\. \\[[ ST]\\]/${step}. [X]/" docs/ROADMAP.md
+        git add docs/ROADMAP.md 2>/dev/null || true
+        git commit -m "chore: mark step ${step} complete in ROADMAP" 2>/dev/null || true
+        git push origin main 2>/dev/null || true
+        log INFO "ROADMAP: step ${step} marked [X]"
+    fi
+}
+
+# Save state.json before git operations that might overwrite it.
+# Belt-and-suspenders defense in case state.json gets re-tracked.
+save_state_before_checkout() {
+    if [ -f "$STATE_FILE" ]; then
+        cp "$STATE_FILE" "${STATE_FILE}.checkout-save" 2>/dev/null || true
+    fi
+}
+
+# Restore state.json if git checkout reverted it to a stale version.
+# Compares step_number and completed[] length to detect regression.
+restore_state_after_checkout() {
+    if [ -f "${STATE_FILE}.checkout-save" ]; then
+        if [ ! -f "$STATE_FILE" ]; then
+            log WARN "state.json disappeared after checkout. Restoring."
+            cp "${STATE_FILE}.checkout-save" "$STATE_FILE"
+        else
+            local saved_step current_step saved_completed current_completed
+            saved_step=$(jq -r '.step_number // 0' "${STATE_FILE}.checkout-save" 2>/dev/null || echo 0)
+            current_step=$(jq -r '.step_number // 0' "$STATE_FILE" 2>/dev/null || echo 0)
+            saved_completed=$(jq '.completed // [] | length' "${STATE_FILE}.checkout-save" 2>/dev/null || echo 0)
+            current_completed=$(jq '.completed // [] | length' "$STATE_FILE" 2>/dev/null || echo 0)
+
+            if [ "$current_completed" -lt "$saved_completed" ] || [ "$current_step" -lt "$saved_step" ]; then
+                log WARN "state.json regressed after checkout (step $current_step<$saved_step or completed $current_completed<$saved_completed). Restoring."
+                cp "${STATE_FILE}.checkout-save" "$STATE_FILE"
+            fi
+        fi
+        rm -f "${STATE_FILE}.checkout-save"
+    fi
+}
+
 # Clean up dirty state left by a previous crash.
 # Called once during initialization, before the main loop.
 recover_dirty_state() {
@@ -244,14 +291,18 @@ recover_dirty_state() {
     current_branch=$(git branch --show-current 2>/dev/null || echo "")
     if [ "$current_branch" != "main" ]; then
         log WARN "Not on main branch (on: '${current_branch:-DETACHED}'). Switching to main."
+        save_state_before_checkout
         git checkout main 2>/dev/null || {
             log ERROR "Cannot checkout main. Forcing."
             git checkout -f main 2>/dev/null || true
         }
+        restore_state_after_checkout
     fi
 
     # Pull latest main
+    save_state_before_checkout
     git pull origin main 2>/dev/null || true
+    restore_state_after_checkout
 
     # Remove stale .tmp files
     rm -f "${STATE_FILE}.tmp" "${STATE_FILE}.bak.tmp"
@@ -286,6 +337,32 @@ recover_dirty_state() {
                 fi
                 ;;
         esac
+    fi
+
+    # Reconcile ROADMAP: if current step's tasks are all completed but
+    # ROADMAP still shows non-[X], mark it now. This catches cases where
+    # the loop halted after completing tasks but before HANDOFF.
+    if [ -f "docs/ROADMAP.md" ] && [ -f "$STATE_FILE" ] && [ -f "$QUEUE_FILE" ]; then
+        local rec_step total_tasks completed_tasks
+        rec_step=$(jq -r '.step_number // empty' "$STATE_FILE" 2>/dev/null)
+        if [ -n "$rec_step" ]; then
+            total_tasks=0
+            completed_tasks=0
+            while IFS='|' read -r task_id _rest; do
+                [[ "$task_id" =~ ^[[:space:]]*# ]] && continue
+                [[ -z "$task_id" ]] && continue
+                task_id=$(echo "$task_id" | xargs)
+                [[ -z "$task_id" ]] && continue
+                total_tasks=$((total_tasks + 1))
+                if jq -e --arg t "$task_id" '.completed // [] | index($t) != null' "$STATE_FILE" >/dev/null 2>&1; then
+                    completed_tasks=$((completed_tasks + 1))
+                fi
+            done < "$QUEUE_FILE"
+
+            if [ "$total_tasks" -gt 0 ] && [ "$completed_tasks" -eq "$total_tasks" ]; then
+                mark_roadmap_step_complete "$rec_step"
+            fi
+        fi
     fi
 
     log INFO "Dirty state recovery complete."
@@ -908,6 +985,8 @@ merge_poll_and_fix() {
 
     local fix_attempt=0
     local feedback_round=0
+    local baseline_check_count=0
+    local deficit_polls=0
 
     while [ "$feedback_round" -le "$max_feedback" ]; do
 
@@ -948,6 +1027,27 @@ merge_poll_and_fix() {
 
             # All checks passed
             if [ "$total_checks" -gt 0 ] && [ "$completed_checks" -eq "$total_checks" ]; then
+                # After feedback pushes a fix, GitHub may not register all check
+                # suites immediately. Require at least as many checks as the
+                # initial round before declaring success.
+                if [ "$baseline_check_count" -gt 0 ] && [ "$total_checks" -lt "$baseline_check_count" ]; then
+                    deficit_polls=$((deficit_polls + 1))
+                    local max_deficit_polls=3
+                    local deficit=$((baseline_check_count - total_checks))
+                    if [ "$deficit_polls" -le "$max_deficit_polls" ]; then
+                        log WARN "PR #$pr_num: only $total_checks/$baseline_check_count checks registered (missing $deficit). Waiting... ($deficit_polls/$max_deficit_polls)"
+                        sleep "$poll_interval"
+                        continue
+                    fi
+                    log WARN "PR #$pr_num: proceeding with $total_checks/$baseline_check_count checks after $max_deficit_polls extra polls"
+                fi
+
+                # Record baseline on first successful poll
+                if [ "$baseline_check_count" -eq 0 ]; then
+                    baseline_check_count=$total_checks
+                    log DEBUG "Baseline check count: $baseline_check_count"
+                fi
+
                 log INFO "PR #$pr_num: all $total_checks checks passed"
                 checks_resolved=true
                 checks_passed=true
@@ -983,6 +1083,17 @@ merge_poll_and_fix() {
                     update_pr_status "$pr_num" "feedback_round_$feedback_round"
                     dispatch "/review-feedback" || true
 
+                    # Guard: detect if skill merged the PR (it shouldn't)
+                    local pr_state_after
+                    pr_state_after=$(gh pr view "$pr_num" --json state -q '.state' 2>/dev/null)
+                    if [ "$pr_state_after" = "MERGED" ]; then
+                        log WARN "PR #$pr_num was merged by /review-feedback (should not happen). Accepting and continuing."
+                        update_pr_status "$pr_num" "merged"
+                        git checkout main 2>/dev/null || true
+                        git pull origin main 2>/dev/null || true
+                        return 0
+                    fi
+
                     git pull origin "$pr_branch" 2>/dev/null || true
                     local new_head
                     new_head=$(git rev-parse HEAD 2>/dev/null)
@@ -999,7 +1110,8 @@ merge_poll_and_fix() {
                     fi
 
                     log INFO "Feedback pushed changes. Re-polling checks."
-                    sleep 10
+                    deficit_polls=0
+                    sleep 30
                     continue  # re-enter check polling loop
                 fi
             fi
@@ -1416,9 +1528,28 @@ while true; do
             STEP=$(state '.step_number')
 
             if [ "$VERDICT" = "SPEC_EXISTS" ]; then
-                log INFO "Step $STEP already has a spec. Advancing to REVIEW_SPEC."
-                jq --arg time "$(date -Iseconds)" \
-                   '.current_state = "CREATE_SPEC" | .last_transition = $time | .last_result.verdict = "SPEC_CREATED"' \
+                # Extract spec_id: try last_result fields, then fall back to directory grep
+                SPEC_ID=$(state '.last_result.spec_id // empty')
+                if [ -z "$SPEC_ID" ]; then
+                    SPEC_PATH=$(state '.last_result.spec_path // empty')
+                    if [ -n "$SPEC_PATH" ]; then
+                        SPEC_ID=$(basename "$(dirname "$SPEC_PATH")")
+                    fi
+                fi
+                if [ -z "$SPEC_ID" ]; then
+                    SPEC_PATH=$(grep -rl "^- Step: ${STEP}$" specs/*/SPEC.md 2>/dev/null | head -1)
+                    [ -n "$SPEC_PATH" ] && SPEC_ID=$(basename "$(dirname "$SPEC_PATH")")
+                fi
+                if [ -z "$SPEC_ID" ]; then
+                    log ERROR "SPEC_EXISTS but cannot determine spec_id for step $STEP"
+                    jq --arg time "$(date -Iseconds)" \
+                       '.current_state = "INIT" | .last_transition = $time | del(.last_result)' \
+                       "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
+                    continue
+                fi
+                log INFO "Step $STEP already has a spec ($SPEC_ID). Advancing to REVIEW_SPEC."
+                jq --arg time "$(date -Iseconds)" --arg sid "$SPEC_ID" \
+                   '.current_state = "CREATE_SPEC" | .last_transition = $time | .spec_id = $sid | .last_result.verdict = "SPEC_CREATED"' \
                    "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
                 continue
             fi
@@ -1718,19 +1849,9 @@ while true; do
                 log INFO "Pulling latest main after merge"
                 git checkout main 2>/dev/null && git pull origin main 2>/dev/null || true
 
-                # Mark ROADMAP step as complete [X] at merge time (not just at handoff).
-                # This prevents restart loops from re-attempting already-merged work.
+                # Mark ROADMAP step as complete [X] when all tasks merged.
                 if [ "$REMAINING" -eq 0 ]; then
-                    STEP=$(state '.step_number')
-                    if [ -n "$STEP" ] && [ -f "docs/ROADMAP.md" ]; then
-                        if grep -qP "^${STEP}\\. \\[ \\]" docs/ROADMAP.md; then
-                            sed -i "s/^${STEP}\\. \\[ \\]/${STEP}. [X]/" docs/ROADMAP.md
-                            git add docs/ROADMAP.md 2>/dev/null || true
-                            git commit -m "chore: mark step ${STEP} complete in ROADMAP" 2>/dev/null || true
-                            git push origin main 2>/dev/null || true
-                            log INFO "ROADMAP: step ${STEP} marked [X]"
-                        fi
-                    fi
+                    mark_roadmap_step_complete "$(state '.step_number')"
                 fi
 
                 if [ "$REMAINING" -gt 0 ]; then
@@ -1801,6 +1922,9 @@ while true; do
         HANDOFF)
             STEP=$(state '.step_number')
             log_separator "Step $STEP Complete"
+
+            # Safety net: ensure ROADMAP is marked before resetting
+            mark_roadmap_step_complete "$STEP"
 
             jq '.current_state = "INIT" | del(.last_result)' \
                 "$STATE_FILE" > "${STATE_FILE}.tmp" && safe_mv_state
