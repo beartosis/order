@@ -67,7 +67,23 @@ STEP_NUM=<extracted step number>
 grep -rl "^- Step: ${STEP_NUM}$" specs/*/SPEC.md 2>/dev/null
 ```
 
-If spec exists, return `SPEC_EXISTS` with the path.
+If spec exists, write the `SPEC_EXISTS` result with `spec_id` and `spec_path`, then stop (do NOT continue to Steps 6-8):
+
+```bash
+SPEC_PATH=$(grep -rl "^- Step: ${STEP_NUM}$" specs/*/SPEC.md 2>/dev/null | head -1)
+SPEC_ID=$(basename "$(dirname "$SPEC_PATH")")
+
+cat .chaos/framework/order/state.json | jq \
+  --arg state "PARSE_ROADMAP" \
+  --arg step "$STEP_NUM" \
+  --arg time "$(date -Iseconds)" \
+  --arg skill "parse-roadmap" \
+  --arg verdict "SPEC_EXISTS" \
+  --arg spec_id "$SPEC_ID" \
+  --arg spec_path "$SPEC_PATH" \
+  '.current_state = $state | .step_number = ($step | tonumber) | .spec_id = $spec_id | .last_transition = $time | .transition_history += [{"from": .current_state, "to": $state, "at": $time}] | .last_result = {skill: $skill, verdict: $verdict, spec_path: $spec_path, spec_id: $spec_id}' \
+  > .chaos/framework/order/state.json.tmp && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
 
 ### Step 6: Extract Phase Context
 
