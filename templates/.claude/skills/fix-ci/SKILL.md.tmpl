@@ -1,0 +1,153 @@
+---
+name: fix-ci
+description: |
+  Worker-level CI failure fixer. Full codebase access, no scope limits.
+  Reads CI logs and spec context to fix the root cause.
+  INTERNAL - invoked by ORDER loop before arbiter on CI failure.
+disable-model-invocation: true
+allowed-tools: Read, Write, Edit, Bash, Grep, Glob
+user-invocable: false
+---
+
+# Fix CI: Worker-Level CI Failure Resolution
+
+You are the developer who wrote the code, and your CI checks have failed. You have full codebase access and no artificial scope limits. Your job is to investigate the failure, understand the root cause, fix it, and verify locally.
+
+Unlike the arbiter (which is a lightweight tactical fixer limited to 5 files and 30 lines), you have full context: you can read the spec, the PR diff, the codebase, and the CI logs to understand WHY the code was written this way and fix the actual problem.
+
+## Workflow
+
+### Step 1: Read CI Context
+
+```bash
+# Extract arbiter_context from state.json
+# CRITICAL: Save pr_number BEFORE writing any verdict (writing deletes arbiter_context)
+PR_NUMBER=$(jq -r '.arbiter_context.pr_number' .chaos/framework/order/state.json)
+PR_BRANCH=$(jq -r '.arbiter_context.pr_branch' .chaos/framework/order/state.json)
+FIX_ATTEMPT=$(jq -r '.arbiter_context.fix_attempt' .chaos/framework/order/state.json)
+SPEC_ID=$(jq -r '.spec_id' .chaos/framework/order/state.json)
+
+# Read the CI failure sidecar log
+cat ".chaos/framework/order/ci-failure-${PR_NUMBER}.log"
+```
+
+### Step 2: Fetch Full CI Logs
+
+```bash
+REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner')
+
+# For each failed check, get the full logs
+for job_id in $(jq -r '.arbiter_context.failed_checks[].job_id // empty' .chaos/framework/order/state.json); do
+    if [[ "$job_id" =~ ^[0-9]+$ ]]; then
+        gh api "repos/$REPO/actions/jobs/${job_id}/logs" 2>/dev/null | tail -200
+    fi
+done
+```
+
+### Step 3: Understand the Context
+
+Read the spec and PR diff to understand intent:
+
+```bash
+# Read the spec for this step
+cat "specs/${SPEC_ID}/SPEC.md" 2>/dev/null
+
+# Read the PR diff to see all changes
+gh pr diff "$PR_NUMBER" 2>/dev/null
+
+# Read project learnings for known patterns
+cat .chaos/learnings.md 2>/dev/null
+```
+
+### Step 4: Categorize the Failure
+
+Match CI output to failure category:
+
+| Category | Indicators | Fix Strategy |
+|----------|-----------|--------------|
+| `format` | prettier check failed | Run formatter, verify |
+| `lint` | eslint errors | Fix root cause (unused imports, missing deps, etc.) |
+| `typecheck` | tsc --noEmit errors | Fix with proper types, never use `any` |
+| `vet` | go vet errors | Fix root cause, never use `// nolint` |
+| `test_backend` | go test failures | Read test + implementation, fix root cause |
+| `build` | compilation errors | Fix syntax, imports, type mismatches |
+
+### Step 5: Fix the Root Cause
+
+Apply the fix. You have no scope limits — fix whatever needs fixing:
+
+- Read the relevant source files
+- Understand why the code was written this way
+- Fix the actual problem (not a workaround)
+- Follow project standards and learnings
+
+**Rules**:
+- NEVER add `eslint-disable` comments
+- NEVER use `any` type or `@ts-ignore`
+- NEVER use `// nolint` comments
+- NEVER skip or remove tests
+- NEVER weaken assertions
+- ALWAYS use the Edit tool for targeted changes (not Write for whole-file replacement)
+- Stage specific files only (never `git add -A`)
+
+### Step 6: Verify Locally
+
+Run the same checks that CI runs, scoped to what you fixed. Run only the checks relevant to what you fixed. Don't run the entire test suite unless the failure was in test execution.
+
+### Step 7: Commit
+
+```bash
+# Stage specific files only
+git add <file1> <file2> ...
+
+# Commit with conventional message
+git commit -m "fix(ci): <description of what was fixed>"
+```
+
+**DO NOT PUSH.** The ORDER loop handles pushing after your commit.
+
+### Step 8: Write Verdict
+
+**On success (FIXED)**:
+
+```bash
+jq --arg pr "$PR_NUMBER" --arg time "$(date -Iseconds)" \
+   '.last_result = {skill: "fix-ci", verdict: "FIXED", pr: $pr, description: "<what was fixed>"} | .last_transition = $time | del(.arbiter_context)' \
+   .chaos/framework/order/state.json > .chaos/framework/order/state.json.tmp \
+   && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+Log to PR:
+```bash
+gh pr comment "$PR_NUMBER" --body "FIX-CI: Fixed — <description> (attempt $FIX_ATTEMPT)"
+```
+
+**On failure (CANNOT_FIX)**:
+
+```bash
+# IMPORTANT: Leave arbiter_context intact so the arbiter can use it
+jq --arg time "$(date -Iseconds)" \
+   '.last_result = {skill: "fix-ci", verdict: "CANNOT_FIX", reason: "<why unfixable>"} | .last_transition = $time' \
+   .chaos/framework/order/state.json > .chaos/framework/order/state.json.tmp \
+   && mv .chaos/framework/order/state.json.tmp .chaos/framework/order/state.json
+```
+
+Use `CANNOT_FIX` when:
+- The failure is a build infrastructure problem (not a code issue)
+- An external dependency is unavailable
+- The fix would require architectural changes beyond the scope of this PR
+- You genuinely cannot determine the root cause
+
+---
+
+## CRITICAL Rules
+
+1. **Save PR_NUMBER first** — Extract it before writing any verdict (writing deletes arbiter_context)
+2. **Read CI logs thoroughly** — Don't guess at the failure. Read the actual output
+3. **Read the spec** — Understand the intent behind the code before fixing
+4. **Fix the root cause** — Not a workaround. If a UUID has non-hex chars, fix the UUID, don't suppress the error
+5. **No lint suppressions** — Never add `eslint-disable`, `@ts-ignore`, `// nolint`, `any` type
+6. **Verify before committing** — Run the relevant check commands locally
+7. **Leave arbiter_context on CANNOT_FIX** — The arbiter needs it if you can't fix the issue
+8. **Do NOT push** — The loop handles pushing. You only commit locally
+9. **Follow learnings** — Check `.chaos/learnings.md` for known fix patterns before investigating from scratch
